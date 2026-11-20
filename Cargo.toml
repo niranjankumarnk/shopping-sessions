@@ -9,9 +9,7 @@ rayon = "1.10"
 memchr = "2.7"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hashbrown = "0.15"
-arrow-array = "55"
-arrow-schema = "55"
-parquet = { version = "55", default-features = false, features = ["arrow"] }
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
