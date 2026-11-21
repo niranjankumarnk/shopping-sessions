@@ -384,7 +384,20 @@ fn parse_ts(s: &[u8], dc: &mut DateCache) -> Option<i64> {
         }
         return Some((day_secs + h * 3600 + mi * 60 + se - off) * 1000);
     }
-    // F3: ASCII digits only.
+    // F3: ASCII digits only. Epoch milliseconds of this era have 13 digits: two overlapping
+    // 8-digit words, each checked and converted at once.
+    if n == 13 {
+        const ZEROS: u64 = 0x3030_3030_3030_3030;
+        let (a, b) = (ld8(s, 0) ^ ZEROS, ld8(s, 5) ^ ZEROS);
+        if !(ok8(a, 0x0606_0606_0606_0606) & ok8(b, 0x0606_0606_0606_0606)) { return None; }
+        #[inline(always)]
+        fn eight(t: u64) -> i64 {
+            let t = pairs(t) & 0x00FF_00FF_00FF_00FF;
+            let t = (t.wrapping_mul(100).wrapping_add(t >> 16)) & 0x0000_FFFF_0000_FFFF;
+            ((t.wrapping_mul(10000).wrapping_add(t >> 32)) & 0xFFFF_FFFF) as i64
+        }
+        return Some(eight(a) * 100_000 + eight(b) % 100_000);
+    }
     if n == 0 { return None; }
     let mut i = 0;
     while i < n && s[i] == b'0' { i += 1; }
@@ -460,7 +473,7 @@ mod tests {
                 0 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", 1990 + r.below(60), r.below(14), r.below(33), r.below(26), r.below(62), r.below(62)).into_bytes(),
                 1 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}", r.below(10000), 1 + r.below(12), 1 + r.below(31), r.below(24), r.below(60), r.below(60),
                              if r.below(2) == 0 { '+' } else { '-' }, r.below(25), r.below(61)).into_bytes(),
-                2 => { let n = 1 + r.below(21); (0..n).map(|k| if k < 3 && r.below(3) == 0 { b'0' } else { b'0' + r.below(10) as u8 }).collect() }
+                2 => { let n = if r.below(2) == 0 { 13 } else { 1 + r.below(21) }; (0..n).map(|k| if k < 3 && r.below(3) == 0 { b'0' } else { b'0' + r.below(10) as u8 }).collect() }
                 _ => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", 2024 + r.below(5), 1 + r.below(12), 1 + r.below(29), r.below(24), r.below(60), r.below(60)).into_bytes(),
             };
             // mutate some of them
@@ -1161,44 +1174,44 @@ struct PartOut {
     chunk: [Vec<u8>; 6], dict_len: [usize; 6],
 }
 
-/// Parquet's RLE/bit-packed hybrid for values of `bw` bits: runs of 8 or more equal values are
-/// run-length coded, everything else is bit-packed in groups of 8.
+/// Parquet's RLE/bit-packed hybrid for values of `bw` bits. Works a group of 8 values at a time:
+/// a group of equal values starts a run-length run that extends as far as the value repeats;
+/// other groups are bit-packed, up to 63 groups under one header byte.
 fn hybrid(v: &[u32], bw: u32, out: &mut Vec<u8>) {
-    fn varint(out: &mut Vec<u8>, mut x: u64) { while x >= 0x80 { out.push(x as u8 | 0x80); x >>= 7; } out.push(x as u8); }
-    fn packed(pend: &mut Vec<u32>, bw: u32, out: &mut Vec<u8>) {
-        if pend.is_empty() { return; }
-        while pend.len() % 8 != 0 { pend.push(0); } // only ever needed at the very end
-        varint(out, ((pend.len() as u64 / 8) << 1) | 1);
+    let vb = ((bw + 7) / 8) as usize;
+    let n = v.len();
+    let mut i = 0usize;
+    let mut open: Option<(usize, u8)> = None; // header position and group count of the bit-packed run being built
+    while i < n {
+        let x = v[i];
+        if i + 8 <= n && v[i + 1..i + 8].iter().all(|&y| y == x) {
+            let mut r = 8;
+            while i + r < n && v[i + r] == x { r += 1; }
+            if let Some((at, g)) = open.take() { out[at] = (g << 1) | 1; }
+            let mut len = (r as u64) << 1;
+            while len >= 0x80 { out.push(len as u8 | 0x80); len >>= 7; }
+            out.push(len as u8);
+            out.extend_from_slice(&x.to_le_bytes()[..vb]);
+            i += r;
+            continue;
+        }
+        let (at, g) = match open { Some((at, g)) if g < 63 => (at, g), other => {
+            if let Some((at, g)) = other { out[at] = (g << 1) | 1; }
+            out.push(0);
+            (out.len() - 1, 0)
+        } };
+        // 8 values of bw bits are exactly bw bytes; a short last group is padded with zeros
         let (mut acc, mut bits) = (0u64, 0u32);
-        for &x in pend.iter() {
-            acc |= (x as u64) << bits;
+        for k in 0..8 {
+            let y = if i + k < n { v[i + k] } else { 0 };
+            acc |= (y as u64) << bits;
             bits += bw;
             while bits >= 8 { out.push(acc as u8); acc >>= 8; bits -= 8; }
         }
-        if bits > 0 { out.push(acc as u8); }
-        pend.clear();
+        open = Some((at, g + 1));
+        i += 8;
     }
-    let vb = ((bw + 7) / 8) as usize;
-    let mut pend: Vec<u32> = Vec::new();
-    let (n, mut i) = (v.len(), 0usize);
-    while i < n {
-        let mut r = 1;
-        while i + r < n && v[i + r] == v[i] { r += 1; }
-        if pend.len() % 8 != 0 {
-            let t = r.min(8 - pend.len() % 8);
-            for _ in 0..t { pend.push(v[i]); }
-            i += t;
-        } else if r >= 8 {
-            packed(&mut pend, bw, out);
-            varint(out, (r as u64) << 1);
-            out.extend_from_slice(&v[i].to_le_bytes()[..vb]);
-            i += r;
-        } else {
-            for _ in 0..r { pend.push(v[i]); }
-            i += r;
-        }
-    }
-    packed(&mut pend, bw, out);
+    if let Some((at, g)) = open { out[at] = (g << 1) | 1; }
 }
 /// Numbers the distinct values of a column in order of first appearance.
 fn number_values(vals: &[u64]) -> (Vec<u64>, Vec<u32>) {
@@ -1208,7 +1221,7 @@ fn number_values(vals: &[u64]) -> (Vec<u64>, Vec<u32>) {
     let mut dict: Vec<u64> = Vec::new();
     let mut idx: Vec<u32> = Vec::with_capacity(vals.len());
     for &v in vals {
-        let slot = if (v as usize) < SMALL && v < SMALL as u64 { &mut small[v as usize] } else { big.entry(v).or_insert(u32::MAX) };
+        let slot = if v < SMALL as u64 { &mut small[v as usize] } else { big.entry(v).or_insert(u32::MAX) };
         if *slot == u32::MAX { *slot = dict.len() as u32; dict.push(v); }
         idx.push(*slot);
     }
@@ -1272,10 +1285,23 @@ impl PartOut {
             for &d in &dict { if wide { body.extend_from_slice(&(d as i64 + add).to_le_bytes()); } else { body.extend_from_slice(&((d as i64 + add) as i32).to_le_bytes()); } }
             dict_chunk(&body, dict.len(), &idx, None, n)
         };
+        // day, sessions and events are small numbers: number them through a direct table
+        let small = |vals: &[u32], add: i64| -> Option<(Vec<u8>, usize)> {
+            const T: usize = 1024;
+            let mut tab = [u16::MAX; T];
+            let (mut body, mut idx, mut nd) = (Vec::new(), Vec::with_capacity(vals.len()), 0u16);
+            for &v in vals {
+                if v as usize >= T { return None; }
+                let slot = &mut tab[v as usize];
+                if *slot == u16::MAX { *slot = nd; nd += 1; body.extend_from_slice(&((v as i64 + add) as i32).to_le_bytes()); }
+                idx.push(*slot as u32);
+            }
+            Some(dict_chunk(&body, nd as usize, &idx, None, n))
+        };
         let widen = |v: &[u32]| -> Vec<u64> { v.iter().map(|&x| x as u64).collect() };
-        (self.chunk[1], self.dict_len[1]) = ints(&widen(&self.day), false, day0);
-        (self.chunk[2], self.dict_len[2]) = ints(&widen(&self.sess), false, 0);
-        (self.chunk[3], self.dict_len[3]) = ints(&widen(&self.evs), false, 0);
+        (self.chunk[1], self.dict_len[1]) = small(&self.day, day0).unwrap_or_else(|| ints(&widen(&self.day), false, day0));
+        (self.chunk[2], self.dict_len[2]) = small(&self.sess, 0).unwrap_or_else(|| ints(&widen(&self.sess), false, 0));
+        (self.chunk[3], self.dict_len[3]) = small(&self.evs, 0).unwrap_or_else(|| ints(&widen(&self.evs), false, 0));
         (self.chunk[4], self.dict_len[4]) = ints(&self.rev, true, 0);
         // top_category: null where there was no purchase
         let def: Vec<u32> = self.top.iter().map(|&c| (c != NO_CAT) as u32).collect();
