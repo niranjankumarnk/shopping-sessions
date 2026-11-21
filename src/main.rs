@@ -1289,10 +1289,22 @@ impl PartOut {
         self.rev = Vec::new();
     }
 }
-/// Writes one Parquet file with one row group per partition.
-fn write_row_groups(path: &Path, cols: &[Col], ps: &[&PartOut]) {
-    let mut bufs: Vec<&[u8]> = vec![b"PAR1"];
+/// Writes one Parquet file with one row group per partition, as the partitions arrive: each row
+/// group goes to the file as soon as its partition is finished, on this thread, so that time the
+/// kernel makes a writer wait is not taken from the threads doing the work. The footer follows
+/// when the channel closes.
+fn stream_row_groups(path: PathBuf, cols: Vec<Col>, rx: std::sync::mpsc::Receiver<PartOut>) {
+    let mut f = File::create(&path).unwrap();
+    f.write_all(b"PAR1").unwrap();
     let mut pos = 4usize;
+    let mut groups: Vec<(usize, [usize; 6], [usize; 6])> = Vec::new(); // rows, chunk lengths, dictionary page lengths
+    for p in rx {
+        let bufs: Vec<&[u8]> = p.chunk.iter().map(|c| c.as_slice()).collect();
+        write_all_slices(&mut f, &bufs);
+        let mut lens = [0usize; 6];
+        for k in 0..6 { lens[k] = p.chunk[k].len(); }
+        groups.push((p.rows, lens, p.dict_len));
+    }
     let mut t = Thrift::new();
     t.i32(1, 1);
     t.list(2, 12, cols.len() + 1);
@@ -1300,7 +1312,7 @@ fn write_row_groups(path: &Path, cols: &[Col], ps: &[&PartOut]) {
     t.binary(4, b"schema");
     t.i32(5, cols.len() as i32);
     t.end();
-    for c in cols {
+    for c in &cols {
         t.begin();
         t.i32(1, c.ty);
         t.i32(3, c.optional as i32);
@@ -1311,14 +1323,13 @@ fn write_row_groups(path: &Path, cols: &[Col], ps: &[&PartOut]) {
         if c.date { t.begin_field(10); t.begin_field(6); t.end(); t.end(); }
         t.end();
     }
-    t.i64(3, ps.iter().map(|p| p.rows as i64).sum());
-    t.list(4, 12, ps.len());
-    for p in ps {
+    t.i64(3, groups.iter().map(|g| g.0 as i64).sum());
+    t.list(4, 12, groups.len());
+    for &(rows, lens, dict_lens) in &groups {
         t.begin();
         t.list(1, 12, cols.len());
         let start = pos;
         for (k, c) in cols.iter().enumerate() {
-            let len = p.chunk[k].len();
             t.begin();
             t.i64(2, pos as i64);
             t.begin_field(3);
@@ -1330,27 +1341,23 @@ fn write_row_groups(path: &Path, cols: &[Col], ps: &[&PartOut]) {
             t.list(3, 8, 1);
             t.bytes(c.name.as_bytes());
             t.i32(4, 0); // UNCOMPRESSED
-            t.i64(5, p.rows as i64);
-            t.i64(6, len as i64);
-            t.i64(7, len as i64);
-            t.i64(9, (pos + p.dict_len[k]) as i64);
+            t.i64(5, rows as i64);
+            t.i64(6, lens[k] as i64);
+            t.i64(7, lens[k] as i64);
+            t.i64(9, (pos + dict_lens[k]) as i64);
             t.i64(11, pos as i64);
             t.end();
             t.end();
-            bufs.push(&p.chunk[k]);
-            pos += len;
+            pos += lens[k];
         }
         t.i64(2, (pos - start) as i64);
-        t.i64(3, p.rows as i64);
+        t.i64(3, rows as i64);
         t.end();
     }
     t.binary(6, b"shopping-sessions");
     t.b.push(0);
     let footer_len = (t.b.len() as u32).to_le_bytes();
-    bufs.push(&t.b);
-    bufs.push(&footer_len);
-    bufs.push(b"PAR1");
-    write_all_slices(&mut File::create(path).unwrap(), &bufs);
+    write_all_slices(&mut f, &[&t.b, &footer_len, b"PAR1"]);
 }
 
 /// User and system CPU seconds of the whole process so far (for the stage log only).
@@ -1670,7 +1677,20 @@ fn main() {
     // started last it would leave the other threads idle at the end.
     let mut order: Vec<usize> = (0..np).collect();
     order.sort_unstable_by_key(|&b| std::cmp::Reverse(part_size[b]));
-    let parts: Vec<PartOut> = order.par_iter().with_max_len(1).map(|&b| {
+    std::fs::create_dir_all(out.join("user_daily")).unwrap();
+    std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
+    let ucols = vec![
+        Col { name: "user_id", ty: T_BYTES, utf8: true, date: false, optional: false },
+        Col { name: "day", ty: T_INT32, utf8: false, date: true, optional: false },
+        Col { name: "sessions", ty: T_INT32, utf8: false, date: false, optional: false },
+        Col { name: "events", ty: T_INT32, utf8: false, date: false, optional: false },
+        Col { name: "revenue_cents", ty: T_INT64, utf8: false, date: false, optional: false },
+        Col { name: "top_category", ty: T_BYTES, utf8: true, date: false, optional: true },
+    ];
+    let (tx, rx) = std::sync::mpsc::channel::<PartOut>();
+    let user_path = out.join("user_daily").join("part-000.parquet");
+    let writer = std::thread::spawn(move || stream_row_groups(user_path, ucols, rx));
+    order.par_iter().with_max_len(1).map(|&b| {
         // This partition's survivors: a piece from every dedup group, each somewhere else in
         // memory, so the next few pieces are requested while one is copied.
         let mut ev: Vec<Sv> = Vec::with_capacity(part_size[b]);
@@ -1915,30 +1935,12 @@ fn main() {
         }
         p.encode(day0, &cats);
         p
-    }).collect();
+    }).for_each_with(tx, |tx, p| if p.rows > 0 { tx.send(p).unwrap(); });
     lap("sessions, credit and assists done");
 
-    // ---- write
-    std::fs::create_dir_all(out.join("user_daily")).unwrap();
-    std::fs::create_dir_all(out.join("campaign_daily")).unwrap();
-    let ucols = [
-        Col { name: "user_id", ty: T_BYTES, utf8: true, date: false, optional: false },
-        Col { name: "day", ty: T_INT32, utf8: false, date: true, optional: false },
-        Col { name: "sessions", ty: T_INT32, utf8: false, date: false, optional: false },
-        Col { name: "events", ty: T_INT32, utf8: false, date: false, optional: false },
-        Col { name: "revenue_cents", ty: T_INT64, utf8: false, date: false, optional: false },
-        Col { name: "top_category", ty: T_BYTES, utf8: true, date: false, optional: true },
-    ];
-    let files = (threads * 2).min(np);
-    let per = np.div_ceil(files);
+    // ---- write: the user table's footer once every partition has arrived, and the campaign table
+    writer.join().unwrap();
     let none: &[u8] = &[];
-    (0..files).into_par_iter().for_each(|g| {
-        let ps: Vec<&PartOut> = parts[(g * per).min(np)..((g + 1) * per).min(np)].iter().filter(|p| p.rows > 0).collect();
-        let rows: usize = ps.iter().map(|p| p.rows).sum();
-        if rows == 0 && g > 0 { return; }
-        write_row_groups(&out.join("user_daily").join(format!("part-{g:03}.parquet")), &ucols, &ps);
-    });
-
     let mut camp = vec![[0i64; 4]; ncamp * ndays];
     for cell in camp_acc.0 { for (a, b) in camp.iter_mut().zip(cell.into_inner()) { for q in 0..4 { a[q] += b[q]; } } }
     let (mut cid, mut chan, mut cday) = (Vec::new(), Vec::new(), Vec::new());
