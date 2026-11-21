@@ -1068,12 +1068,21 @@ fn parse_events<const WIDE: bool>(part: &[u8], c: &EvCtx) -> ChunkOut {
 unsafe fn parse_events_fast(part: &[u8], c: &EvCtx) -> ChunkOut { parse_events::<true>(part, c) }
 
 struct CkCtx<'a> { ws: i64, we: i64, campaigns: &'a IdMap<u32>, camp_names: &'a [&'a [u8]], links: &'a LinkTab, np: usize, np_mask: u64 }
-/// Parses one chunk of a clicks file: the valid clicks with their person, and how many fall in
-/// each person partition.
+/// The valid clicks of one parsed chunk in one exactly sized block, ordered by person partition:
+/// partition p is `part_off[p] .. part_off[p + 1]`.
+struct ClickChunk { block: Vec<Ck>, part_off: Vec<u32> }
+thread_local! {
+    /// Per-thread staging for one chunk's clicks, reused chunk after chunk.
+    static CLICK_STAGE: std::cell::RefCell<Vec<Ck>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// Parses one chunk of a clicks file: its valid clicks, each with its person, ordered by person
+/// partition.
 #[inline(always)]
-fn parse_clicks<const WIDE: bool>(part: &[u8], c: &CkCtx) -> (Vec<Ck>, Vec<u32>) {
+fn parse_clicks<const WIDE: bool>(part: &[u8], c: &CkCtx) -> ClickChunk {
     let (ws, we) = (c.ws, c.we);
-    let mut v: Vec<Ck> = Vec::with_capacity(part.len() / 40 + 4);
+    // one chunk at a time per thread, and nothing below re-enters this function
+    let v = unsafe { &mut *CLICK_STAGE.with(|s| s.as_ptr()) };
+    v.clear();
     let mut dc = DateCache::new();
     scan_lines::<4, WIDE>(part, |[id, user, camp, ts]| {
         if id.is_empty() || user.is_empty() { return; }
@@ -1083,19 +1092,32 @@ fn parse_clicks<const WIDE: bool>(part: &[u8], c: &CkCtx) -> (Vec<Ck>, Vec<u32>)
         if c.camp_names[k as usize] != camp { return; }
         v.push(Ck { pk: xxh3_64(user), tc: (((t - (ws - WEEK_MS)) as u64) << CAMP_BITS) | k as u64, id: pack(id) });
     });
-    let mut cnt = vec![0u32; c.np];
+    let mut part_off = vec![0u32; c.np + 1];
     for blk in v.chunks_mut(32) {
         for k in blk.iter() { prefetch(c.links.slot(k.pk)); }
         for k in blk.iter_mut() {
             k.pk = c.links.person(k.pk, 1).0;
-            cnt[pbucket(k.pk, c.np_mask)] += 1;
+            part_off[pbucket(k.pk, c.np_mask) + 1] += 1;
         }
     }
-    (v, cnt)
+    for p in 0..c.np { part_off[p + 1] += part_off[p]; }
+    let n = v.len();
+    let mut block: Vec<Ck> = Vec::with_capacity(n.max(1));
+    let base = block.as_mut_ptr();
+    let mut next: Vec<u32> = part_off[..c.np].to_vec();
+    for k in v.iter() {
+        unsafe {
+            let slot = next.get_unchecked_mut(pbucket(k.pk, c.np_mask));
+            base.add(*slot as usize).write(*k);
+            *slot += 1;
+        }
+    }
+    unsafe { block.set_len(n); }
+    ClickChunk { block, part_off }
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
-unsafe fn parse_clicks_fast(part: &[u8], c: &CkCtx) -> (Vec<Ck>, Vec<u32>) { parse_clicks::<true>(part, c) }
+unsafe fn parse_clicks_fast(part: &[u8], c: &CkCtx) -> ClickChunk { parse_clicks::<true>(part, c) }
 
 /// One person partition's user_daily rows, already PLAIN-encoded per column.
 #[derive(Default)]
@@ -1397,42 +1419,18 @@ fn main() {
     // ---- clicks: parse, validate, resolve people; copies are identical, so dedup happens after the sort
     let ck_files = map_dir(&data.join("clicks"));
     let ck_bytes: usize = ck_files.iter().map(|d| d.len()).sum();
-    let ck_chunk = (ck_bytes / (threads * 8)).clamp(1 << 20, 16 << 20);
+    let ck_chunk = (ck_bytes / (threads * 8)).clamp(1 << 20, 8 << 20);
     let ck_parts: Vec<&'static [u8]> = ck_files.iter().flat_map(|d| chunks(d, ck_chunk)).collect();
     let ck_ctx = CkCtx { ws, we, campaigns: &campaigns, camp_names: &camp_names, links: &links, np, np_mask };
-    let ck_parsed: Vec<(Vec<Ck>, Vec<u32>)> = ck_parts.par_iter().map(|part| {
+    let click_chunks: Vec<ClickChunk> = ck_parts.par_iter().map(|part| {
         #[cfg(target_arch = "x86_64")]
         if fast { return unsafe { parse_clicks_fast(part, &ck_ctx) }; }
         parse_clicks::<false>(part, &ck_ctx)
     }).collect();
-    let scatter_offsets = |counts: &Vec<Vec<u32>>| -> (Vec<usize>, Vec<Vec<usize>>) {
-        let mut base = vec![0usize; np + 1];
-        for c in counts { for p in 0..np { base[p + 1] += c[p] as usize; } }
-        for p in 0..np { base[p + 1] += base[p]; }
-        let mut run = base.clone();
-        let offs = counts.iter().map(|c| {
-            let o: Vec<usize> = run[..np].to_vec();
-            for p in 0..np { run[p] += c[p] as usize; }
-            o
-        }).collect();
-        (base, offs)
-    };
-    let ck_counts: Vec<Vec<u32>> = ck_parsed.iter().map(|x| x.1.clone()).collect();
-    let (ck_base, ck_offs) = scatter_offsets(&ck_counts);
-    let total_ck = ck_base[np];
-    let mut cks: Vec<Ck> = Vec::with_capacity(total_ck);
-    advise_huge(&cks);
-    note_vec(&cks);
-    unsafe { cks.set_len(total_ck); }
-    let cks_ptr = Raw(cks.as_mut_ptr());
-    ck_parsed.par_iter().zip(ck_offs.into_par_iter()).for_each(|((v, _), mut off)| {
-        for c in v {
-            let p = pbucket(c.pk, np_mask);
-            unsafe { cks_ptr.get().add(off[p]).write(*c); }
-            off[p] += 1;
-        }
-    });
-    ck_parsed.into_par_iter().for_each(|(v, _)| { release_pages(&v); drop(v); });
+    rayon::broadcast(|_| { let b = unsafe { &mut *CLICK_STAGE.with(|s| s.as_ptr()) }; release_pages(b); });
+    // the session stage reads the click blocks in place: one piece per chunk for each partition
+    for c in &click_chunks { note_vec(&c.block); }
+    let total_ck: usize = click_chunks.iter().map(|c| c.block.len()).sum();
     lap(&format!("clicks parsed: {} valid", total_ck));
 
     // ---- per partition: sort, sessionize, credit, assists, user_daily pages
@@ -1461,7 +1459,17 @@ fn main() {
                 g.copy_range(g.part_off[b] + here, g.part_off[b + 1], &mut ev);
             }
         }
-        let ck_all: &mut [Ck] = unsafe { std::slice::from_raw_parts_mut(cks_ptr.get().add(ck_base[b]), ck_base[b + 1] - ck_base[b]) };
+        // this partition's clicks, a piece from every click chunk
+        let ck_pieces: Vec<&[Ck]> = click_chunks.iter().map(|c| &c.block[c.part_off[b] as usize..c.part_off[b + 1] as usize]).collect();
+        let mut ck_all: Vec<Ck> = Vec::with_capacity(ck_pieces.iter().map(|x| x.len()).sum());
+        for (k, piece) in ck_pieces.iter().enumerate() {
+            if k + 4 < ck_pieces.len() {
+                let f = ck_pieces[k + 4].as_ptr() as *const u8;
+                prefetch(f);
+                prefetch(f.wrapping_add(64));
+            }
+            ck_all.extend_from_slice(piece);
+        }
         // each rayon worker owns one accumulator
         let camp: &mut Vec<[i64; 4]> = camp_acc.mine();
         let mut p = PartOut::default();
