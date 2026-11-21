@@ -91,7 +91,16 @@ const PRICE_BITS: u32 = 24;
 struct Sv { pk: u64, ts: i64, name: u64, price: u32, cat: u32 }
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Ck { pk: u64, ts: i64, id: u64, camp: u32, pad: u32 }
+struct Ck { pk: u64, tc: u64, id: u64 }
+// `tc` packs the time since the earliest valid click (window_start - 7 days), in milliseconds,
+// above the campaign number (23 bits).
+const CAMP_BITS: u32 = 23;
+impl Ck {
+    #[inline(always)]
+    fn off(&self) -> u64 { self.tc >> CAMP_BITS }
+    #[inline(always)]
+    fn camp(&self) -> u32 { (self.tc & ((1 << CAMP_BITS) - 1)) as u32 }
+}
 
 // ---------------------------------------------------------------- line splitting
 /// Reads one line starting at `*pos`, moves `*pos` past its `\n`, and returns its N fields with
@@ -1047,7 +1056,7 @@ fn parse_clicks<const WIDE: bool>(part: &[u8], c: &CkCtx) -> (Vec<Ck>, Vec<u32>)
         if t < ws - WEEK_MS || t >= we { return; }
         let Some(&k) = c.campaigns.get(&xxh3_64(camp)) else { return };
         if c.camp_names[k as usize] != camp { return; }
-        v.push(Ck { pk: xxh3_64(user), ts: t, id: pack(id), camp: k, pad: 0 });
+        v.push(Ck { pk: xxh3_64(user), tc: (((t - (ws - WEEK_MS)) as u64) << CAMP_BITS) | k as u64, id: pack(id) });
     });
     let mut cnt = vec![0u32; c.np];
     for blk in v.chunks_mut(32) {
@@ -1217,6 +1226,7 @@ fn main() {
     let np = knob("SS_NP").unwrap_or((est_events / 20_000).next_power_of_two().clamp(16, 4096)); // person partitions
     assert!(we - ws < 1i64 << 40 && we >= ws, "window too long for the packed timestamp");
     assert!(cats.len() <= u16::MAX as usize, "too many categories for the packed record");
+    assert!(ncamp < 1 << CAMP_BITS, "too many campaigns for the packed click");
     let np_mask = (np - 1) as u64;
     let chunk = (ev_bytes / (threads * 8)).clamp(1 << 20, 16 << 20);
     let ev_parts: Vec<&'static [u8]> = ev_files.iter().flat_map(|d| chunks(d, chunk)).collect();
@@ -1502,19 +1512,20 @@ fn main() {
             pc.clear();
             if pc_all.len() < (1 << CLICK_INDEX_BITS) {
                 ckeys.clear();
-                ckeys.extend(pc_all.iter().enumerate().map(|(x, c)| (((c.ts - click_base) as u64) << CLICK_INDEX_BITS) | x as u64));
+                ckeys.extend(pc_all.iter().enumerate().map(|(x, c)| (c.off() << CLICK_INDEX_BITS) | x as u64));
                 ckeys.sort_unstable();
                 let mut run = 0usize; // where the current run of equal times starts in `pc`
                 for (pos, &key) in ckeys.iter().enumerate() {
                     let c = &pc_all[(key & ((1 << CLICK_INDEX_BITS) - 1)) as usize];
-                    if pos > 0 && pc[pos - 1].0 != c.ts { run = pos; }
-                    pc.push((c.ts, c.camp, c.id));
+                    let ts = click_base + c.off() as i64;
+                    if pos > 0 && pc[pos - 1].0 != ts { run = pos; }
+                    pc.push((ts, c.camp(), c.id));
                     // keep the smallest id of the run at its end
                     if pos > run && unpack(pc[pos].2) > unpack(pc[pos - 1].2) { pc.swap(pos, pos - 1); }
                 }
             } else {
-                pc_all.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| if x.id == y.id { std::cmp::Ordering::Equal } else { unpack(y.id).cmp(unpack(x.id)) }));
-                pc.extend(pc_all.iter().map(|c| (c.ts, c.camp, c.id)));
+                pc_all.sort_unstable_by(|x, y| x.off().cmp(&y.off()).then_with(|| if x.id == y.id { std::cmp::Ordering::Equal } else { unpack(y.id).cmp(unpack(x.id)) }));
+                pc.extend(pc_all.iter().map(|c| (click_base + c.off() as i64, c.camp(), c.id)));
             }
             let pc: &[(i64, u32, u64)] = &pc;
             starts.clear(); runs.clear();
