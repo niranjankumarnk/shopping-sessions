@@ -622,57 +622,173 @@ impl LinkTab {
     }
 }
 
+/// One link line: each ID as its hash, its packed name, and its first 16 bytes as a number.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Pair { ka: u128, kb: u128, ha: u64, na: u64, hb: u64, nb: u64 }
+/// Union-find node. On a root, `name` and `key` are the byte-wise smallest name of its set and
+/// `size` is the set's size.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Node { key: u128, name: u64, parent: u32, size: u32 }
+
+/// The first 16 bytes of a name, zero-padded, as a big-endian number: two names whose keys differ
+/// compare byte-wise the way their keys do.
+#[inline(always)]
+fn prefix_key(b: &[u8]) -> u128 {
+    let mut x = [0u8; 16];
+    let n = b.len().min(16);
+    x[..n].copy_from_slice(&b[..n]);
+    u128::from_be_bytes(x)
+}
+#[inline(always)]
+fn name_less(ka: u128, na: u64, kb: u128, nb: u64) -> bool {
+    if ka != kb { ka < kb } else { unpack(na) < unpack(nb) }
+}
+/// The hash of a packed name, taken from its key when the whole name is in the key.
+#[inline(always)]
+fn name_hash(key: u128, name: u64) -> u64 {
+    let len = (name >> 48) as usize;
+    if len <= 16 { xxh3_64(&key.to_be_bytes()[..len]) } else { xxh3_64(unpack(name)) }
+}
+
+/// Builds the link table. Runs on a side thread while the events are parsed. The one-thread part
+/// (numbering the IDs and joining them) works a small batch at a time so that its table and node
+/// reads can be prefetched; resolving every ID to its person and filling the table runs on all
+/// threads.
 fn build_links(dir: PathBuf) -> LinkTab {
+    let t0 = Instant::now();
     let files = map_dir(&dir);
     let parts: Vec<&'static [u8]> = files.iter().flat_map(|d| chunks(d, 4 << 20)).collect();
-    let pairs: Vec<Vec<[u64; 4]>> = parts.par_iter().map(|part| {
+    let pairs: Vec<Vec<Pair>> = parts.par_iter().map(|part| {
         let mut v = Vec::with_capacity(part.len() / 16 + 4);
         scan_lines::<2, false>(part, |[a, b]| {
             if a.is_empty() || b.is_empty() { return; }
-            v.push([xxh3_64(a), pack(a), xxh3_64(b), pack(b)]);
+            v.push(Pair { ka: prefix_key(a), kb: prefix_key(b), ha: xxh3_64(a), na: pack(a), hb: xxh3_64(b), nb: pack(b) });
         });
         v
     }).collect();
     let npairs: usize = pairs.iter().map(|v| v.len()).sum();
-    let mut idx: IdMap<u32> = IdMap::default();
-    idx.reserve(npairs * 2);
-    let mut names: Vec<u64> = Vec::with_capacity(npairs * 2);
-    let mut keys: Vec<u64> = Vec::with_capacity(npairs * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(npairs * 2);
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        let mut r = x;
-        while parent[r as usize] != r { r = parent[r as usize]; }
-        while parent[x as usize] != r { let n = parent[x as usize]; parent[x as usize] = r; x = n; }
-        r
+    let t_pairs = t0.elapsed().as_secs_f64();
+
+    // ---- number the distinct IDs and join each pair, one thread
+    let cap = (npairs * 3).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut tab: Vec<[u64; 2]> = vec![[0u64; 2]; cap]; // (hash, number + 1), open addressing
+    advise_huge(&tab);
+    let mut nodes: Vec<Node> = Vec::with_capacity(npairs * 2 + 1);
+    let mut keys: Vec<u64> = Vec::with_capacity(npairs * 2 + 1);
+    advise_huge(&nodes);
+    #[inline(always)]
+    fn intern(tab: &mut [[u64; 2]], mask: usize, nodes: &mut Vec<Node>, keys: &mut Vec<u64>, h: u64, name: u64, key: u128) -> u32 {
+        let mut s = h as usize & mask;
+        loop {
+            let e = unsafe { *tab.get_unchecked(s) };
+            if e[1] == 0 {
+                let id = nodes.len() as u32;
+                unsafe { *tab.get_unchecked_mut(s) = [h, id as u64 + 1]; }
+                nodes.push(Node { key, name, parent: id, size: 1 });
+                keys.push(h);
+                return id;
+            }
+            if e[0] == h { return (e[1] - 1) as u32; }
+            s = (s + 1) & mask;
+        }
     }
+    #[inline(always)]
+    fn find(nodes: &mut [Node], mut x: u32) -> u32 {
+        loop {
+            let p = nodes[x as usize].parent;
+            if p == x { return x; }
+            let g = nodes[p as usize].parent;
+            nodes[x as usize].parent = g; // path halving
+            x = g;
+        }
+    }
+    const BATCH: usize = 16;
+    let mut ids = [(0u32, 0u32); BATCH];
     for v in &pairs {
-        for &[ha, na, hb, nb] in v {
-            let mut get = |h: u64, name: u64| -> u32 {
-                let next = names.len() as u32;
-                *idx.entry(h).or_insert_with(|| { names.push(name); keys.push(h); parent.push(next); next })
-            };
-            let (ia, ib) = (get(ha, na), get(hb, nb));
-            let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
-            if ra != rb {
-                // the root is always the byte-wise smallest name of its set
-                if unpack(names[ra as usize]) < unpack(names[rb as usize]) { parent[rb as usize] = ra; } else { parent[ra as usize] = rb; }
+        for blk in v.chunks(BATCH) {
+            for p in blk {
+                prefetch(tab.as_ptr().wrapping_add(p.ha as usize & mask));
+                prefetch(tab.as_ptr().wrapping_add(p.hb as usize & mask));
+            }
+            for (k, p) in blk.iter().enumerate() {
+                let ia = intern(&mut tab, mask, &mut nodes, &mut keys, p.ha, p.na, p.ka);
+                let ib = intern(&mut tab, mask, &mut nodes, &mut keys, p.hb, p.nb, p.kb);
+                ids[k] = (ia, ib);
+                prefetch(nodes.as_ptr().wrapping_add(ia as usize));
+                prefetch(nodes.as_ptr().wrapping_add(ib as usize));
+            }
+            for &(ia, ib) in &ids[..blk.len()] {
+                let (mut ra, mut rb) = (find(&mut nodes, ia), find(&mut nodes, ib));
+                if ra == rb { continue; }
+                if nodes[ra as usize].size < nodes[rb as usize].size { std::mem::swap(&mut ra, &mut rb); }
+                // the smaller set joins the larger; the root keeps the smaller of the two best names
+                let b = nodes[rb as usize];
+                nodes[rb as usize].parent = ra;
+                let a = &mut nodes[ra as usize];
+                a.size += b.size;
+                if name_less(b.key, b.name, a.key, a.name) { a.key = b.key; a.name = b.name; }
             }
         }
     }
-    drop(idx);
-    let cap = (names.len() * 2).next_power_of_two().max(16);
-    let mask = cap - 1;
-    let mut slots = vec![[0u64; 4]; cap];
+    let t_joined = t0.elapsed().as_secs_f64();
+
+    // ---- every ID -> (person key, person name), on all threads
+    let n = nodes.len();
+    let tcap = (n * 2).next_power_of_two().max(16);
+    let tmask = tcap - 1;
+    let mut slots = vec![[0u64; 4]; tcap];
     advise_huge(&slots);
     note_vec(&slots);
-    for i in 0..names.len() as u32 {
-        let r = find(&mut parent, i) as usize;
-        let h = keys[i as usize];
-        let mut s = h as usize & mask;
-        while slots[s][2] != 0 { s = (s + 1) & mask; }
-        slots[s] = [h, keys[r], names[r], 0];
-    }
-    LinkTab { mask, slots }
+    let slots_ptr = Raw(slots.as_mut_ptr());
+    let (nodes_ref, keys_ref) = (&nodes, &keys);
+    const STEP: usize = 8192;
+    (0..n.div_ceil(STEP)).into_par_iter().for_each(|c| {
+        let (lo, hi) = (c * STEP, ((c + 1) * STEP).min(n));
+        let mut i = lo;
+        while i < hi {
+            let end = (i + BATCH).min(hi);
+            for k in i..end {
+                prefetch(nodes_ref.as_ptr().wrapping_add(nodes_ref[k].parent as usize));
+                prefetch(slots_ptr.get().wrapping_add(keys_ref[k] as usize & tmask));
+            }
+            for k in i..end {
+                let mut r = k;
+                loop {
+                    let p = nodes_ref[r].parent as usize;
+                    if p == r { break; }
+                    r = p;
+                }
+                let root = &nodes_ref[r];
+                let (h, pk, name) = (keys_ref[k], name_hash(root.key, root.name), root.name);
+                // claim the first free slot by its name word; nobody reads the other words until
+                // every thread is done
+                let mut s = h as usize & tmask;
+                loop {
+                    let slot = unsafe { slots_ptr.get().add(s) };
+                    let name_word = unsafe { std::sync::atomic::AtomicU64::from_ptr(std::ptr::addr_of_mut!((*slot)[2])) };
+                    if name_word.compare_exchange(0, name, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok() {
+                        unsafe {
+                            std::ptr::addr_of_mut!((*slot)[0]).write(h);
+                            std::ptr::addr_of_mut!((*slot)[1]).write(pk);
+                        }
+                        break;
+                    }
+                    s = (s + 1) & tmask;
+                }
+            }
+            i = end;
+        }
+    });
+    eprintln!("          links: {} pairs parsed at {:.3}s, {} ids joined at {:.3}s, table filled at {:.3}s", npairs, t_pairs, n, t_joined, t0.elapsed().as_secs_f64());
+    // the working memory is dead: give its pages back from this thread, not at exit
+    release_pages(&tab);
+    release_pages(&nodes);
+    release_pages(&keys);
+    for v in &pairs { release_pages(v); }
+    LinkTab { mask: tmask, slots }
 }
 
 // ---------------------------------------------------------------- Parquet, by hand
@@ -1118,6 +1234,7 @@ fn main() {
         if fast { return unsafe { parse_events_fast(part, &ev_ctx) }; }
         parse_events::<false>(part, &ev_ctx)
     }).collect();
+    rayon::broadcast(|_| { let (a, b) = unsafe { &mut *STAGE.with(|s| s.as_ptr()) }; release_pages(a); release_pages(b); });
     lap(&format!("events parsed ({} dedup buckets, {} person partitions, {} parser)", nb, np, if fast { "AVX2" } else { "baseline" }));
 
     let links = links_thread.join().unwrap();
@@ -1245,6 +1362,7 @@ fn main() {
             off[p] += 1;
         }
     });
+    ck_parsed.into_par_iter().for_each(|(v, _)| { release_pages(&v); drop(v); });
     lap(&format!("clicks parsed: {} valid", total_ck));
 
     // ---- per partition: sort, sessionize, credit, assists, user_daily pages
