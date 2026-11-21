@@ -1153,7 +1153,205 @@ unsafe fn parse_clicks_fast(part: &[u8], c: &CkCtx) -> ClickChunk { parse_clicks
 
 /// One person partition's user_daily rows, already PLAIN-encoded per column.
 #[derive(Default)]
-struct PartOut { rows: usize, user: Vec<u8>, day: Vec<u8>, sess: Vec<u8>, evs: Vec<u8>, rev: Vec<u8>, bits: Vec<u8>, def: Vec<u8>, top: Vec<u8> }
+struct PartOut {
+    rows: usize,
+    // the rows as produced: packed person name, day index, sessions, events, revenue, category (or NO_CAT)
+    names: Vec<u64>, day: Vec<u32>, sess: Vec<u32>, evs: Vec<u32>, rev: Vec<u64>, top: Vec<u32>,
+    // the same rows as one Parquet row group: per column a dictionary page followed by a data page
+    chunk: [Vec<u8>; 6], dict_len: [usize; 6],
+}
+
+/// Parquet's RLE/bit-packed hybrid for values of `bw` bits: runs of 8 or more equal values are
+/// run-length coded, everything else is bit-packed in groups of 8.
+fn hybrid(v: &[u32], bw: u32, out: &mut Vec<u8>) {
+    fn varint(out: &mut Vec<u8>, mut x: u64) { while x >= 0x80 { out.push(x as u8 | 0x80); x >>= 7; } out.push(x as u8); }
+    fn packed(pend: &mut Vec<u32>, bw: u32, out: &mut Vec<u8>) {
+        if pend.is_empty() { return; }
+        while pend.len() % 8 != 0 { pend.push(0); } // only ever needed at the very end
+        varint(out, ((pend.len() as u64 / 8) << 1) | 1);
+        let (mut acc, mut bits) = (0u64, 0u32);
+        for &x in pend.iter() {
+            acc |= (x as u64) << bits;
+            bits += bw;
+            while bits >= 8 { out.push(acc as u8); acc >>= 8; bits -= 8; }
+        }
+        if bits > 0 { out.push(acc as u8); }
+        pend.clear();
+    }
+    let vb = ((bw + 7) / 8) as usize;
+    let mut pend: Vec<u32> = Vec::new();
+    let (n, mut i) = (v.len(), 0usize);
+    while i < n {
+        let mut r = 1;
+        while i + r < n && v[i + r] == v[i] { r += 1; }
+        if pend.len() % 8 != 0 {
+            let t = r.min(8 - pend.len() % 8);
+            for _ in 0..t { pend.push(v[i]); }
+            i += t;
+        } else if r >= 8 {
+            packed(&mut pend, bw, out);
+            varint(out, (r as u64) << 1);
+            out.extend_from_slice(&v[i].to_le_bytes()[..vb]);
+            i += r;
+        } else {
+            for _ in 0..r { pend.push(v[i]); }
+            i += r;
+        }
+    }
+    packed(&mut pend, bw, out);
+}
+/// Numbers the distinct values of a column in order of first appearance.
+fn number_values(vals: &[u64]) -> (Vec<u64>, Vec<u32>) {
+    const SMALL: usize = 2048;
+    let mut small = [u32::MAX; SMALL];
+    let mut big: HashMap<u64, u32> = HashMap::new();
+    let mut dict: Vec<u64> = Vec::new();
+    let mut idx: Vec<u32> = Vec::with_capacity(vals.len());
+    for &v in vals {
+        let slot = if (v as usize) < SMALL && v < SMALL as u64 { &mut small[v as usize] } else { big.entry(v).or_insert(u32::MAX) };
+        if *slot == u32::MAX { *slot = dict.len() as u32; dict.push(v); }
+        idx.push(*slot);
+    }
+    (dict, idx)
+}
+/// One column chunk: a PLAIN dictionary page, then one data page of dictionary indices (with
+/// definition levels first when the column is optional). Returns the bytes and the length of
+/// the dictionary page.
+fn dict_chunk(dict_body: &[u8], ndict: usize, idx: &[u32], def: Option<&[u32]>, nrows: usize) -> (Vec<u8>, usize) {
+    let mut body: Vec<u8> = Vec::with_capacity(idx.len() * 2 + 16);
+    if let Some(d) = def {
+        let mut lv = Vec::new();
+        hybrid(d, 1, &mut lv);
+        body.extend_from_slice(&(lv.len() as u32).to_le_bytes());
+        body.extend_from_slice(&lv);
+    }
+    let bw = (32 - (ndict.max(2) as u32 - 1).leading_zeros()).max(1);
+    body.push(bw as u8);
+    hybrid(idx, bw, &mut body);
+    let mut h = Thrift::new();
+    h.i32(1, 2); // DICTIONARY_PAGE
+    h.i32(2, dict_body.len() as i32);
+    h.i32(3, dict_body.len() as i32);
+    h.begin_field(7);
+    h.i32(1, ndict as i32);
+    h.i32(2, 0); // PLAIN
+    h.end();
+    h.b.push(0);
+    let mut out = h.b;
+    out.extend_from_slice(dict_body);
+    let dict_len = out.len();
+    let mut h = Thrift::new();
+    h.i32(1, 0); // DATA_PAGE
+    h.i32(2, body.len() as i32);
+    h.i32(3, body.len() as i32);
+    h.begin_field(5);
+    h.i32(1, nrows as i32);
+    h.i32(2, 8); // RLE_DICTIONARY
+    h.i32(3, 3);
+    h.i32(4, 3);
+    h.end();
+    h.b.push(0);
+    out.extend_from_slice(&h.b);
+    out.extend_from_slice(&body);
+    (out, dict_len)
+}
+impl PartOut {
+    /// Turns the collected rows into the row group's six column chunks.
+    fn encode(&mut self, day0: i64, cats: &[&[u8]]) {
+        let n = self.rows;
+        // user_id: a person's rows are adjacent, so each new name is the next dictionary entry
+        let (mut body, mut idx, mut nd) = (Vec::new(), Vec::with_capacity(n), 0u32);
+        for (k, &name) in self.names.iter().enumerate() {
+            if k == 0 || name != self.names[k - 1] { put_str(&mut body, unpack(name)); nd += 1; }
+            idx.push(nd - 1);
+        }
+        (self.chunk[0], self.dict_len[0]) = dict_chunk(&body, nd as usize, &idx, None, n);
+        let ints = |vals: &[u64], wide: bool, add: i64| -> (Vec<u8>, usize) {
+            let (dict, idx) = number_values(vals);
+            let mut body = Vec::with_capacity(dict.len() * 8);
+            for &d in &dict { if wide { body.extend_from_slice(&(d as i64 + add).to_le_bytes()); } else { body.extend_from_slice(&((d as i64 + add) as i32).to_le_bytes()); } }
+            dict_chunk(&body, dict.len(), &idx, None, n)
+        };
+        let widen = |v: &[u32]| -> Vec<u64> { v.iter().map(|&x| x as u64).collect() };
+        (self.chunk[1], self.dict_len[1]) = ints(&widen(&self.day), false, day0);
+        (self.chunk[2], self.dict_len[2]) = ints(&widen(&self.sess), false, 0);
+        (self.chunk[3], self.dict_len[3]) = ints(&widen(&self.evs), false, 0);
+        (self.chunk[4], self.dict_len[4]) = ints(&self.rev, true, 0);
+        // top_category: null where there was no purchase
+        let def: Vec<u32> = self.top.iter().map(|&c| (c != NO_CAT) as u32).collect();
+        let present: Vec<u64> = self.top.iter().filter(|&&c| c != NO_CAT).map(|&c| c as u64).collect();
+        let (dict, idx) = number_values(&present);
+        let mut body = Vec::new();
+        for &d in &dict { put_str(&mut body, cats[d as usize]); }
+        (self.chunk[5], self.dict_len[5]) = dict_chunk(&body, dict.len(), &idx, Some(&def), n);
+        for v in [&mut self.day, &mut self.sess, &mut self.evs, &mut self.top] { *v = Vec::new(); }
+        self.names = Vec::new();
+        self.rev = Vec::new();
+    }
+}
+/// Writes one Parquet file with one row group per partition.
+fn write_row_groups(path: &Path, cols: &[Col], ps: &[&PartOut]) {
+    let mut bufs: Vec<&[u8]> = vec![b"PAR1"];
+    let mut pos = 4usize;
+    let mut t = Thrift::new();
+    t.i32(1, 1);
+    t.list(2, 12, cols.len() + 1);
+    t.begin();
+    t.binary(4, b"schema");
+    t.i32(5, cols.len() as i32);
+    t.end();
+    for c in cols {
+        t.begin();
+        t.i32(1, c.ty);
+        t.i32(3, c.optional as i32);
+        t.binary(4, c.name.as_bytes());
+        if c.utf8 { t.i32(6, 0); }
+        if c.date { t.i32(6, 6); }
+        if c.utf8 { t.begin_field(10); t.begin_field(1); t.end(); t.end(); }
+        if c.date { t.begin_field(10); t.begin_field(6); t.end(); t.end(); }
+        t.end();
+    }
+    t.i64(3, ps.iter().map(|p| p.rows as i64).sum());
+    t.list(4, 12, ps.len());
+    for p in ps {
+        t.begin();
+        t.list(1, 12, cols.len());
+        let start = pos;
+        for (k, c) in cols.iter().enumerate() {
+            let len = p.chunk[k].len();
+            t.begin();
+            t.i64(2, pos as i64);
+            t.begin_field(3);
+            t.i32(1, c.ty);
+            t.list(2, 5, 3);
+            t.zigzag(0);
+            t.zigzag(3);
+            t.zigzag(8);
+            t.list(3, 8, 1);
+            t.bytes(c.name.as_bytes());
+            t.i32(4, 0); // UNCOMPRESSED
+            t.i64(5, p.rows as i64);
+            t.i64(6, len as i64);
+            t.i64(7, len as i64);
+            t.i64(9, (pos + p.dict_len[k]) as i64);
+            t.i64(11, pos as i64);
+            t.end();
+            t.end();
+            bufs.push(&p.chunk[k]);
+            pos += len;
+        }
+        t.i64(2, (pos - start) as i64);
+        t.i64(3, p.rows as i64);
+        t.end();
+    }
+    t.binary(6, b"shopping-sessions");
+    t.b.push(0);
+    let footer_len = (t.b.len() as u32).to_le_bytes();
+    bufs.push(&t.b);
+    bufs.push(&footer_len);
+    bufs.push(b"PAR1");
+    write_all_slices(&mut File::create(path).unwrap(), &bufs);
+}
 
 /// User and system CPU seconds of the whole process so far (for the stage log only).
 fn cpu_seconds() -> (f64, f64) {
@@ -1579,7 +1777,7 @@ fn main() {
         let ev: &mut [Sv] = &mut evs_sorted;
 
         let guess = ev.len() / 4 + 16;
-        p.user.reserve(guess * 16); p.day.reserve(guess * 4); p.sess.reserve(guess * 4); p.evs.reserve(guess * 4); p.rev.reserve(guess * 8);
+        p.names.reserve(guess); p.day.reserve(guess); p.sess.reserve(guess); p.evs.reserve(guess); p.rev.reserve(guess); p.top.reserve(guess);
         let mut cat_sum = vec![0i64; cats.len()];
         let mut touched: Vec<u32> = Vec::new();
         let mut starts: Vec<i64> = Vec::new();       // this person's session starts
@@ -1643,7 +1841,7 @@ fn main() {
             let pc: &[(i64, u32, u64)] = &pc;
             starts.clear(); runs.clear();
 
-            let name = unpack(ev[i].name);
+            let name = ev[i].name; // packed; the bytes are read when the row group is encoded
             let mut k = i;
             let mut cptr = 0usize; // clicks with ts <= current session start
             let (mut cur_day, mut d_sessions, mut d_events, mut d_rev) = (usize::MAX, 0i64, 0i64, 0i64);
@@ -1657,16 +1855,12 @@ fn main() {
                 }
                 for &c in touched.iter() { cat_sum[c as usize] = 0; }
                 touched.clear();
-                put_str(&mut p.user, name);
-                p.day.extend_from_slice(&((day0 + day as i64) as i32).to_le_bytes());
-                p.sess.extend_from_slice(&(s as i32).to_le_bytes());
-                p.evs.extend_from_slice(&(e as i32).to_le_bytes());
-                p.rev.extend_from_slice(&r.to_le_bytes());
-                if p.rows % 8 == 0 { p.bits.push(0); }
-                if best != NO_CAT {
-                    *p.bits.last_mut().unwrap() |= 1 << (p.rows % 8);
-                    put_str(&mut p.top, cats[best as usize]);
-                }
+                p.names.push(name);
+                p.day.push(day as u32);
+                p.sess.push(s as u32);
+                p.evs.push(e as u32);
+                p.rev.push(r as u64);
+                p.top.push(best);
                 p.rows += 1;
             };
             while k < j {
@@ -1719,12 +1913,7 @@ fn main() {
                 }
             }
         }
-        // definition levels of top_category: one bit-packed run, behind its 4-byte length
-        let mut runs_hdr = Thrift::new();
-        runs_hdr.varint(((p.bits.len() as u64) << 1) | 1);
-        p.def.extend_from_slice(&((runs_hdr.b.len() + p.bits.len()) as u32).to_le_bytes());
-        p.def.extend_from_slice(&runs_hdr.b);
-        p.def.extend_from_slice(&p.bits);
+        p.encode(day0, &cats);
         p
     }).collect();
     lap("sessions, credit and assists done");
@@ -1747,15 +1936,7 @@ fn main() {
         let ps: Vec<&PartOut> = parts[(g * per).min(np)..((g + 1) * per).min(np)].iter().filter(|p| p.rows > 0).collect();
         let rows: usize = ps.iter().map(|p| p.rows).sum();
         if rows == 0 && g > 0 { return; }
-        let pages: Vec<Vec<Page>> = vec![
-            ps.iter().map(|p| Page { nvals: p.rows, body: [&p.user, none] }).collect(),
-            ps.iter().map(|p| Page { nvals: p.rows, body: [&p.day, none] }).collect(),
-            ps.iter().map(|p| Page { nvals: p.rows, body: [&p.sess, none] }).collect(),
-            ps.iter().map(|p| Page { nvals: p.rows, body: [&p.evs, none] }).collect(),
-            ps.iter().map(|p| Page { nvals: p.rows, body: [&p.rev, none] }).collect(),
-            ps.iter().map(|p| Page { nvals: p.rows, body: [&p.def, &p.top] }).collect(),
-        ];
-        write_parquet(&out.join("user_daily").join(format!("part-{g:03}.parquet")), &ucols, rows, &pages);
+        write_row_groups(&out.join("user_daily").join(format!("part-{g:03}.parquet")), &ucols, &ps);
     });
 
     let mut camp = vec![[0i64; 4]; ncamp * ndays];
