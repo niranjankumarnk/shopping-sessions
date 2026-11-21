@@ -141,7 +141,7 @@ fn split_line<'a, const N: usize>(data: &'a [u8], pos: &mut usize) -> Option<[&'
     Some(out)
 }
 
-/// Two bit masks for one block of bytes: the field and line ends (`,` and `\n`), and the quotes.
+/// Three bit masks for one block of bytes: the commas, the newlines and the quotes.
 /// Bit `i << MASK_SHIFT` is byte i.
 #[cfg(target_arch = "x86_64")]
 const BLOCK: usize = 64;
@@ -149,17 +149,17 @@ const BLOCK: usize = 64;
 const MASK_SHIFT: u32 = 0;
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn delim_masks(p: *const u8) -> (u64, u64) {
+unsafe fn delim_masks(p: *const u8) -> (u64, u64, u64) {
     use core::arch::x86_64::*; // SSE2 is part of every x86-64 CPU
     let (c, n, q) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b'"' as i8));
-    let (mut dm, mut qm) = (0u64, 0u64);
+    let (mut cm, mut nm, mut qm) = (0u64, 0u64, 0u64);
     for k in 0..4 {
         let v = _mm_loadu_si128(p.add(k * 16) as *const __m128i);
-        let d = _mm_or_si128(_mm_cmpeq_epi8(v, c), _mm_cmpeq_epi8(v, n));
-        dm |= (_mm_movemask_epi8(d) as u32 as u64) << (k * 16);
+        cm |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, c)) as u32 as u64) << (k * 16);
+        nm |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, n)) as u32 as u64) << (k * 16);
         qm |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, q)) as u32 as u64) << (k * 16);
     }
-    (dm, qm)
+    (cm, nm, qm)
 }
 #[cfg(target_arch = "aarch64")]
 const BLOCK: usize = 16;
@@ -167,115 +167,108 @@ const BLOCK: usize = 16;
 const MASK_SHIFT: u32 = 2;
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn delim_masks(p: *const u8) -> (u64, u64) {
+unsafe fn delim_masks(p: *const u8) -> (u64, u64, u64) {
     use core::arch::aarch64::*;
     let v = vld1q_u8(p);
-    let d = vorrq_u8(vceqq_u8(v, vdupq_n_u8(b',')), vceqq_u8(v, vdupq_n_u8(b'\n')));
-    let q = vceqq_u8(v, vdupq_n_u8(b'"'));
     // 4 bits per byte; keep one of them
     let nib = |x: uint8x16_t| vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(x)))) & 0x8888_8888_8888_8888;
-    (nib(d), nib(q))
+    (nib(vceqq_u8(v, vdupq_n_u8(b','))), nib(vceqq_u8(v, vdupq_n_u8(b'\n'))), nib(vceqq_u8(v, vdupq_n_u8(b'"'))))
 }
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const BLOCK: usize = usize::MAX / 2;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const MASK_SHIFT: u32 = 0;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-#[inline(always)]
-unsafe fn delim_masks(_: *const u8) -> (u64, u64) { (0, 0) }
 
-/// The same two masks from two 32-byte loads. Only called from code compiled for AVX2.
+/// The same three masks from two 32-byte loads. Only called from code compiled for AVX2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn wide_masks(p: *const u8) -> (u64, u64) {
+unsafe fn wide_masks(p: *const u8) -> (u64, u64, u64) {
     use core::arch::x86_64::*;
     let (c, n, q) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
     let v0 = _mm256_loadu_si256(p as *const __m256i);
     let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
-    let d0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, c), _mm256_cmpeq_epi8(v0, n));
-    let d1 = _mm256_or_si256(_mm256_cmpeq_epi8(v1, c), _mm256_cmpeq_epi8(v1, n));
-    let dm = (_mm256_movemask_epi8(d0) as u32 as u64) | ((_mm256_movemask_epi8(d1) as u32 as u64) << 32);
-    let qm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, q)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, q)) as u32 as u64) << 32);
-    (dm, qm)
+    let two = |a: __m256i, b: __m256i| (_mm256_movemask_epi8(a) as u32 as u64) | ((_mm256_movemask_epi8(b) as u32 as u64) << 32);
+    (two(_mm256_cmpeq_epi8(v0, c), _mm256_cmpeq_epi8(v1, c)), two(_mm256_cmpeq_epi8(v0, n), _mm256_cmpeq_epi8(v1, n)), two(_mm256_cmpeq_epi8(v0, q), _mm256_cmpeq_epi8(v1, q)))
 }
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn wide_masks(p: *const u8) -> (u64, u64) { delim_masks(p) }
+unsafe fn wide_masks(p: *const u8) -> (u64, u64, u64) { delim_masks(p) }
 
 /// Calls `f` with the N fields of every well-formed line of `data`, whole-field quotes stripped.
 /// `WIDE` picks the AVX2 masks; it may only be true inside code compiled for AVX2 (see `fast_cpu`).
 /// Same rules as `split_line`. Only commas and newlines are visited one by one; quotes are counted
 /// per line, and a line is well formed when every quote is the first or last byte of a field that
 /// both starts and ends with one: quotes in the line == 2 x such fields.
+///
+/// The last partial block is scanned from a zero-padded copy, with a newline added after the
+/// data if its last line has none, so every line ends in the one loop and `f` has one call site.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
-#[allow(unused_assignments)]
 fn scan_lines<'a, const N: usize, const WIDE: bool>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     let len = data.len();
     let ptr = data.as_ptr();
     let mut cuts = [0usize; 9];
     assert!(N <= 8);
     let (mut n, mut line, mut qtot, mut qstart) = (0usize, 0usize, 0usize, 0usize);
-    macro_rules! line_end {
-        ($i:expr, $quotes:expr) => {{
-            let i: usize = $i;
-            let quotes: usize = $quotes;
-            if n == N - 1 {
-                cuts[N - 1] = i;
-                let mut out: [&[u8]; N] = [&[]; N];
-                let mut a = line;
-                let mut nq = 0usize;
-                for k in 0..N {
-                    let b = cuts[k];
-                    let (mut x, mut y) = (a, b);
-                    if b - a >= 2 {
-                        let isq = unsafe { (*ptr.add(a) == b'"') & (*ptr.add(b - 1) == b'"') } as usize;
-                        nq += isq;
-                        x += isq;
-                        y -= isq;
-                    }
-                    out[k] = unsafe { std::slice::from_raw_parts(ptr.add(x), y - x) };
-                    a = b + 1;
-                }
-                if quotes == 2 * nq { f(out); }
-            }
-            n = 0;
-            line = i + 1;
-        }};
-    }
-    let mut pos = 0usize;
-    while pos + BLOCK <= len {
-        let (mut m, qm) = unsafe { if WIDE { wide_masks(ptr.add(pos)) } else { delim_masks(ptr.add(pos)) } };
+    let whole = len / BLOCK;
+    let rem = len - whole * BLOCK;
+    let open = len > 0 && data[len - 1] != b'\n';
+    let blocks = whole + (rem > 0 || open) as usize;
+    let mut tail = [0u8; BLOCK];
+    for bi in 0..blocks {
+        let pos = bi * BLOCK;
+        let src = if bi < whole {
+            unsafe { ptr.add(pos) }
+        } else {
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(pos), tail.as_mut_ptr(), rem); }
+            if open { tail[rem] = b'\n'; }
+            tail.as_ptr()
+        };
+        let (cm, nm, qm) = unsafe { if WIDE { wide_masks(src) } else { delim_masks(src) } };
+        let mut m = cm | nm;
         while m != 0 {
             let t = m.trailing_zeros();
             let i = pos + (t >> MASK_SHIFT) as usize;
-            if unsafe { *ptr.add(i) } == b',' {
+            if (nm >> t) & 1 == 0 {
                 unsafe { *cuts.get_unchecked_mut(n) = i; }
                 n = (n + 1).min(N);
             } else {
+                // a line ends at i (for an added newline, i is the length of the data)
                 let seen = qtot + (qm & ((1u64 << t) - 1)).count_ones() as usize;
-                line_end!(i, seen - qstart);
+                let quotes = seen - qstart;
                 qstart = seen;
+                if n == N - 1 {
+                    cuts[N - 1] = i;
+                    let mut out: [&[u8]; N] = [&[]; N];
+                    let mut a = line;
+                    let mut nq = 0usize;
+                    for k in 0..N {
+                        let b = cuts[k];
+                        let (mut x, mut y) = (a, b);
+                        if b - a >= 2 {
+                            let isq = unsafe { (*ptr.add(a) == b'"') & (*ptr.add(b - 1) == b'"') } as usize;
+                            nq += isq;
+                            x += isq;
+                            y -= isq;
+                        }
+                        out[k] = unsafe { std::slice::from_raw_parts(ptr.add(x), y - x) };
+                        a = b + 1;
+                    }
+                    if quotes == 2 * nq { f(out); }
+                }
+                n = 0;
+                line = i + 1;
             }
             m &= m - 1;
         }
         qtot += qm.count_ones() as usize;
-        pos += BLOCK;
     }
-    while pos < len {
-        let c = unsafe { *ptr.add(pos) };
-        if c == b',' {
-            cuts[n] = pos;
-            n = (n + 1).min(N);
-        } else if c == b'"' {
-            qtot += 1;
-        } else if c == b'\n' {
-            line_end!(pos, qtot - qstart);
-            qstart = qtot;
-        }
-        pos += 1;
+}
+/// Other architectures: the plain scanner.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn scan_lines<'a, const N: usize, const WIDE: bool>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    let mut pos = 0;
+    while pos < data.len() {
+        if let Some(x) = split_line::<N>(data, &mut pos) { f(x); }
     }
-    if line < len { line_end!(len, qtot - qstart); }
 }
 
 fn chunks(data: &'static [u8], chunk: usize) -> Vec<&'static [u8]> {
