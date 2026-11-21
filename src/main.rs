@@ -628,8 +628,8 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
 // ---------------------------------------------------------------- links
 /// user-id hash -> person key, only for IDs whose person is not themselves; and person key ->
 /// packed name, for people with two or more IDs. The first table is in 64-byte buckets of four
-/// entries filled in order, so a lookup reads one cache line unless its bucket is full. A key of
-/// 0 marks an empty entry.
+/// entries filled in order, so a lookup reads one cache line unless its bucket is full, and
+/// compares all four entries without a branch per entry. A key of 0 marks an empty entry.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct LinkBucket { h: [u64; 4], pk: [u64; 4] }
@@ -643,10 +643,12 @@ impl LinkTab {
         let mut i = h as usize & self.mask;
         loop {
             let b = unsafe { self.slots.get_unchecked(i) };
-            for j in 0..4 {
-                if b.h[j] == h { return b.pk[j]; }
-                if b.h[j] == 0 { return h; }
-            }
+            // without a branch per entry: entries fill a bucket in order, so an ID not in a bucket
+            // whose last entry is empty is in no later bucket either
+            let m = [b.h[0] == h, b.h[1] == h, b.h[2] == h, b.h[3] == h];
+            let pk = if m[0] { b.pk[0] } else if m[1] { b.pk[1] } else if m[2] { b.pk[2] } else { b.pk[3] };
+            let found = m[0] | m[1] | m[2] | m[3];
+            if found | (b.h[3] == 0) { return if found { pk } else { h }; }
             i = (i + 1) & self.mask;
         }
     }
@@ -792,8 +794,8 @@ fn build_links(dir: PathBuf, helpers: usize) -> LinkTab {
     let t_joined = t0.elapsed().as_secs_f64();
 
     // ---- every ID -> its person key, on this stage's own threads. Only IDs whose person is not
-    // themselves get a slot, 16 bytes each, so the table the per-event lookups hit stays small; the
-    // person's name is looked up once per person, from a second table keyed by person.
+    // themselves get an entry, 16 bytes each, and an entry holds no name: the person's name is
+    // looked up once per person, from a second table keyed by person.
     let n = nodes.len();
     let mut pks: Vec<u64> = Vec::with_capacity(n);
     unsafe { pks.set_len(n); }
@@ -830,8 +832,8 @@ fn build_links(dir: PathBuf, helpers: usize) -> LinkTab {
         }
     });
     let moved = moved.into_inner();
-    // about two entries per bucket: fuller buckets overflow into the next line too often
-    let tcap = (moved / 2 + 1).next_power_of_two().max(16);
+    // about one bucket per entry: measured faster than fuller, smaller tables at 20M and 60M events
+    let tcap = (moved + 1).next_power_of_two().max(16);
     let tmask = tcap - 1;
     let mut slots = vec![LinkBucket { h: [0; 4], pk: [0; 4] }; tcap];
     advise_huge(&slots);
@@ -1813,8 +1815,9 @@ fn main() {
         // An event's key is its time since the window start (40 bits) above 24 bits that are 0, or
         // for a purchase, 1 + its index in `buys`; the 32-byte records are read twice and never move.
         let n = ev.len();
-        let cap = (n + n / 2 + 1).next_power_of_two();
-        let shift = 64 - cap.trailing_zeros();
+        // sized for a few dozen events per person, and doubled whenever it gets half full
+        let mut cap = (n / 8 + 64).next_power_of_two();
+        let mut shift = 64 - cap.trailing_zeros();
         let mut t_pk: Vec<u64> = vec![0; cap];
         let mut t_id: Vec<u32> = vec![u32::MAX; cap];
         let mut ev_id: Vec<u32> = Vec::with_capacity(n);
@@ -1830,6 +1833,18 @@ fn main() {
                     t_id[s] = id;
                     e_off.push(0);
                     pinfo.push((e.pk, e.name));
+                    if e_off.len() * 2 > cap {
+                        cap *= 2;
+                        shift -= 1;
+                        t_pk = vec![0; cap];
+                        t_id = vec![u32::MAX; cap];
+                        for (k, &(pk, _)) in pinfo.iter().enumerate() {
+                            let mut s = (pk.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize;
+                            while t_id[s] != u32::MAX { s = (s + 1) & (cap - 1); }
+                            t_pk[s] = pk;
+                            t_id[s] = k as u32;
+                        }
+                    }
                     break id;
                 }
                 if t_pk[s] == e.pk { break id; }
