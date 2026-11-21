@@ -1367,7 +1367,11 @@ fn main() {
 
     // ---- per partition: sort, sessionize, credit, assists, user_daily pages
     let camp_acc: PerThread<Vec<[i64; 4]>> = PerThread((0..threads).map(|_| UnsafeCell::new(vec![[0i64; 4]; ncamp * ndays])).collect());
-    let parts: Vec<PartOut> = (0..np).into_par_iter().map(|b| {
+    // Largest partitions first, one task each: a whale person is a long single-threaded job, and
+    // started last it would leave the other threads idle at the end.
+    let mut order: Vec<usize> = (0..np).collect();
+    order.sort_unstable_by_key(|&b| std::cmp::Reverse(ev_base[b + 1] - ev_base[b]));
+    let parts: Vec<PartOut> = order.par_iter().with_max_len(1).map(|&b| {
         let ev: &mut [Sv] = unsafe { std::slice::from_raw_parts_mut(evs_ptr.get().add(ev_base[b]), ev_base[b + 1] - ev_base[b]) };
         let ck_all: &mut [Ck] = unsafe { std::slice::from_raw_parts_mut(cks_ptr.get().add(ck_base[b]), ck_base[b + 1] - ck_base[b]) };
         // each rayon worker owns one accumulator
