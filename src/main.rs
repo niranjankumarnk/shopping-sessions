@@ -298,18 +298,41 @@ fn pairs(t: u64) -> u64 { t.wrapping_mul(10).wrapping_add(t >> 8) }
 fn byte(v: u64, k: u32) -> i64 { ((v >> (8 * k)) & 0xFF) as i64 }
 static DIM: [i64; 16] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0];
 
+/// The dates already validated, keyed by their ten bytes (`YYYY-MM-DD`), one slot per day of the
+/// month. A data set holds a few weeks of dates, so nearly every timestamp finds its date here
+/// and skips the calendar arithmetic.
+struct DateCache { key0: [u64; 32], key1: [u16; 32], secs: [i64; 32] }
+impl DateCache {
+    fn new() -> DateCache { DateCache { key0: [0; 32], key1: [0; 32], secs: [0; 32] } }
+}
+
 /// Epoch milliseconds, or None for a bad timestamp (window not checked here).
 #[inline(always)]
-fn parse_ts(s: &[u8]) -> Option<i64> {
+fn parse_ts(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = s.len();
     if (n == 20 || n == 25) && s[4] == b'-' {
         // YYYY-MM- | DDTHH:MM | then H:MM:SSZ (F1) or SS+HH:MM after a ':' (F2)
-        let t0 = ld8(s, 0) ^ le([b'0', b'0', b'0', b'0', b'-', b'0', b'0', b'-']);
+        let k0 = ld8(s, 0);
+        let k1 = u16::from_le_bytes([s[8], s[9]]);
+        let slot = (((s[8] & 3) * 10 + (s[9] & 15)) & 31) as usize;
         let t1 = ld8(s, 8) ^ le([b'0', b'0', b'T', b'0', b'0', b':', b'0', b'0']);
-        let mut ok = ok8(t0, le([DIG, DIG, DIG, DIG, SEP, DIG, DIG, SEP])) & ok8(t1, le([DIG, DIG, SEP, DIG, DIG, SEP, DIG, DIG]));
-        let (p0, p1) = (pairs(t0), pairs(t1));
-        let (cc, yy, mo) = (byte(p0, 0), byte(p0, 2), byte(p0, 5));
-        let (d, h, mi) = (byte(p1, 0), byte(p1, 3), byte(p1, 6));
+        let mut ok = ok8(t1, le([DIG, DIG, SEP, DIG, DIG, SEP, DIG, DIG]));
+        let p1 = pairs(t1);
+        let (h, mi) = (byte(p1, 3), byte(p1, 6));
+        let hit = (dc.key0[slot] == k0) & (dc.key1[slot] == k1);
+        let day_secs = if hit {
+            dc.secs[slot]
+        } else {
+            let t0 = k0 ^ le([b'0', b'0', b'0', b'0', b'-', b'0', b'0', b'-']);
+            let p0 = pairs(t0);
+            let (cc, yy, mo) = (byte(p0, 0), byte(p0, 2), byte(p0, 5));
+            let d = byte(p1, 0);
+            let leap = if yy != 0 { yy & 3 == 0 } else { cc & 3 == 0 };
+            let dim = DIM[(mo & 15) as usize] + ((mo == 2) & leap) as i64;
+            ok &= ok8(t0, le([DIG, DIG, DIG, DIG, SEP, DIG, DIG, SEP])) & (mo >= 1) & (mo <= 12) & (d >= 1) & (d <= dim);
+            if !ok { return None; }
+            days_from_civil(cc * 100 + yy, mo, d) * 86400
+        };
         let (se, off);
         if n == 20 {
             let t2 = ld8(s, 12) ^ le([b'0', b':', b'0', b'0', b':', b'0', b'0', b'Z']);
@@ -326,12 +349,15 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
             ok &= (oh <= 23) & (om <= 59);
             off = if sign == b'+' { oh * 3600 + om * 60 } else { -(oh * 3600 + om * 60) };
         }
-        let leap = if yy != 0 { yy & 3 == 0 } else { cc & 3 == 0 };
-        let dim = DIM[(mo & 15) as usize] + ((mo == 2) & leap) as i64;
-        ok &= (mo >= 1) & (mo <= 12) & (d >= 1) & (d <= dim) & (h <= 23) & (mi <= 59) & (se <= 59);
+        ok &= (h <= 23) & (mi <= 59) & (se <= 59);
         if !ok { return None; }
-        let secs = days_from_civil(cc * 100 + yy, mo, d) * 86400 + h * 3600 + mi * 60 + se;
-        return Some((secs - off) * 1000);
+        if !hit {
+            // the whole timestamp is valid, so its date is
+            dc.key0[slot] = k0;
+            dc.key1[slot] = k1;
+            dc.secs[slot] = day_secs;
+        }
+        return Some((day_secs + h * 3600 + mi * 60 + se - off) * 1000);
     }
     // F3: ASCII digits only.
     if n == 0 { return None; }
@@ -402,6 +428,8 @@ mod tests {
         let junk = b"0123456789-:TZtz+ .,\"\xff\x00/;aA";
         let mut checked = 0u64;
         let mut valid = 0u64;
+        let mut dc = DateCache::new();
+        let mut hits = 0u64;
         for round in 0..6_000_000u64 {
             let mut s: Vec<u8> = match r.below(4) {
                 0 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", 1990 + r.below(60), r.below(14), r.below(33), r.below(26), r.below(62), r.below(62)).into_bytes(),
@@ -423,17 +451,20 @@ mod tests {
                     if s.is_empty() { break; }
                 }
             }
-            let (a, b) = (parse_ts(&s), parse_ts_ref(&s));
+            let (a, b) = (parse_ts(&s, &mut dc), parse_ts_ref(&s));
             assert_eq!(a, b, "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(parse_ts(&s, &mut DateCache::new()), b, "fresh cache {:?}", String::from_utf8_lossy(&s));
+            hits += (a.is_some() && s.len() >= 20 && s[4] == b'-') as u64;
             checked += 1;
             valid += a.is_some() as u64;
         }
-        assert!(valid > checked / 4 && valid < checked);
+        assert!(valid > checked / 4 && valid < checked && hits > checked / 8);
         for s in [&b""[..], b"2028-02-29T00:00:00Z", b"2027-02-29T00:00:00Z", b"2100-02-29T00:00:00Z", b"2000-02-29T23:59:59+00:00", b"2026-10-03T19:58:10-04:00",
                   b"2026-10-03T23:58:10Z", b"1791071890000", b"0001791071890000", b"2026-10-03T23:58:10z", b"2026-10-03t23:58:10Z", b"2026-10-03T24:00:00Z",
                   b"2026-10-03T23:58:60Z", b"2026-13-03T23:58:10Z", b"2026-10-03T23:58:10+24:00", b"2026-10-03T23:58:10+05:60", b"2026-10-03T23:58:10-00:00",
                   b"2026-10-03T23:58:10+0200x", b"00000000000000000000", b"99999999999999999999", b"0000-0000000000000000", b"1.79e12", b"-5", b"86400000"] {
-            assert_eq!(parse_ts(s), parse_ts_ref(s), "{:?}", String::from_utf8_lossy(s));
+            assert_eq!(parse_ts(s, &mut dc), parse_ts_ref(s), "{:?}", String::from_utf8_lossy(s));
+            assert_eq!(parse_ts(s, &mut dc), parse_ts_ref(s), "second time {:?}", String::from_utf8_lossy(s));
         }
     }
     #[test]
@@ -531,7 +562,7 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
     let rest = &rest[a + 1..];
     let q1 = rest.find('"').unwrap();
     let q2 = rest[q1 + 1..].find('"').unwrap();
-    parse_ts(rest[q1 + 1..q1 + 1 + q2].as_bytes()).expect("manifest timestamp")
+    parse_ts(rest[q1 + 1..q1 + 1 + q2].as_bytes(), &mut DateCache::new()).expect("manifest timestamp")
 }
 
 // ---------------------------------------------------------------- links
@@ -923,18 +954,19 @@ fn main() {
         let base = block.as_mut_ptr();
         let mut lens = vec![0u32; nb];
         let mut over: Vec<Vec<Ev>> = Vec::new();
+        let mut dc = DateCache::new();
         scan_lines::<7>(part, |[id, user, ts, ingest, ty, product, price]| {
             if id.is_empty() { return; }
             let h = xxh3_128(id);
             let hi = (h >> 64) as u64;
-            let ingest_ms = parse_ts(ingest);
+            let ingest_ms = parse_ts(ingest, &mut dc);
             let mut e = Ev { eid: h as u64, user: 0, name: 0, ts: DEAD, eid2: hi as u32, ingest: i32::MIN, price: 0, cat: 0 };
             if let Some(ing) = ingest_ms {
                 e.ingest = ((ing - ws).div_euclid(1000)).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32;
             }
             (|| {
                 if user.is_empty() || product.is_empty() { return; }
-                let Some(t) = parse_ts(ts) else { return };
+                let Some(t) = parse_ts(ts, &mut dc) else { return };
                 if t < ws || t >= we { return; }
                 let Some(ing) = ingest_ms else { return };
                 if ing - t > DAY_MS { return; }
@@ -1072,9 +1104,10 @@ fn main() {
     let ck_parts: Vec<&'static [u8]> = ck_files.iter().flat_map(|d| chunks(d, ck_chunk)).collect();
     let ck_parsed: Vec<(Vec<Ck>, Vec<u32>)> = ck_parts.par_iter().map(|part| {
         let mut v: Vec<Ck> = Vec::with_capacity(part.len() / 40 + 4);
+        let mut dc = DateCache::new();
         scan_lines::<4>(part, |[id, user, camp, ts]| {
             if id.is_empty() || user.is_empty() { return; }
-            let Some(t) = parse_ts(ts) else { return };
+            let Some(t) = parse_ts(ts, &mut dc) else { return };
             if t < ws - WEEK_MS || t >= we { return; }
             let Some(&c) = campaigns.get(&xxh3_64(camp)) else { return };
             if camp_names[c as usize] != camp { return; }
