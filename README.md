@@ -13,8 +13,8 @@ pipeline that reads the click-stream CSVs from `/data` and writes
 
 No pre-existing repository was used. Written during the event with AI
 assistance. Open-source crates: memmap2, rayon, memchr, xxhash-rust,
-hashbrown, arrow-array, arrow-schema, parquet. The files in `scripts/` come
-from the track's starter kit.
+hashbrown, libc. The Parquet files are written by hand (uncompressed, PLAIN
+pages). The files in `scripts/` come from the track's starter kit.
 
 ## License
 

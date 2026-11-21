@@ -810,6 +810,7 @@ fn main() {
     let mut camp_names: Vec<&[u8]> = vec![b"organic"];
     let mut camp_chan: Vec<&[u8]> = vec![b"organic"];
     let mut campaigns: IdMap<u32> = IdMap::default(); // by hash; lookups confirm the bytes
+    let mut camp_seen: hashbrown::HashSet<&[u8]> = hashbrown::HashSet::new();
     if let Some(d) = map_file(&data.join("campaigns.csv")) {
         for part in chunks(d, usize::MAX / 2) {
             let mut pos = 0;
@@ -817,7 +818,7 @@ fn main() {
                 let Some([c, ch]) = split_line::<2>(part, &mut pos) else { continue };
                 if c.is_empty() { continue; }
                 let next = camp_names.len() as u32;
-                if camp_names.iter().skip(1).any(|&n| n == c) { continue; }
+                if !camp_seen.insert(c) { continue; }
                 let h = xxh3_64(c);
                 assert!(!campaigns.contains_key(&h), "campaign hash clash");
                 campaigns.insert(h, next);
