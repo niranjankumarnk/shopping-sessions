@@ -1453,7 +1453,11 @@ fn main() {
         // window start (40 bits), the record's index within the person (23 bits), and whether it
         // is a purchase (1 bit). A person with 2^23 events or more is sorted the plain way.
         const KEY_INDEX_BITS: u32 = 23;
+        const CLICK_INDEX_BITS: u32 = 22;
+        let click_base = ws - WEEK_MS; // the earliest valid click time
         let mut keys: Vec<u64> = Vec::new();
+        let mut pc: Vec<(i64, u32, u64)> = Vec::new();
+        let mut ckeys: Vec<u64> = Vec::new();
         for person in 0..people {
             let (i, j) = (e_off[person] as usize, e_off[person + 1] as usize);
             // the name's bytes are in a mapped file, far from anything in cache: ask for them early
@@ -1477,16 +1481,29 @@ fn main() {
                     (e.ts, if e.price > 0 { Some(e) } else { None })
                 }
             };
-            // this person's clicks: latest ts last; among equal ts the smallest click_id last; copies dropped
+            // This person's clicks as (time, campaign) in time order, and among clicks at the same
+            // millisecond the one with the byte-wise smallest click_id last: that is the one a
+            // session starting then is credited to. Copies of a click are left in: they carry the
+            // same time and campaign, so they change neither the credit nor the assists.
             let pc_all = &mut cks_sorted[c_off[person] as usize..c_off[person + 1] as usize];
-            pc_all.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| if x.id == y.id { std::cmp::Ordering::Equal } else { unpack(y.id).cmp(unpack(x.id)) }));
-            let mut w = 0usize;
-            for r in 0..pc_all.len() {
-                if w > 0 && pc_all[w - 1].ts == pc_all[r].ts && unpack(pc_all[w - 1].id) == unpack(pc_all[r].id) { continue; }
-                pc_all[w] = pc_all[r];
-                w += 1;
+            pc.clear();
+            if pc_all.len() < (1 << CLICK_INDEX_BITS) {
+                ckeys.clear();
+                ckeys.extend(pc_all.iter().enumerate().map(|(x, c)| (((c.ts - click_base) as u64) << CLICK_INDEX_BITS) | x as u64));
+                ckeys.sort_unstable();
+                let mut run = 0usize; // where the current run of equal times starts in `pc`
+                for (pos, &key) in ckeys.iter().enumerate() {
+                    let c = &pc_all[(key & ((1 << CLICK_INDEX_BITS) - 1)) as usize];
+                    if pos > 0 && pc[pos - 1].0 != c.ts { run = pos; }
+                    pc.push((c.ts, c.camp, c.id));
+                    // keep the smallest id of the run at its end
+                    if pos > run && unpack(pc[pos].2) > unpack(pc[pos - 1].2) { pc.swap(pos, pos - 1); }
+                }
+            } else {
+                pc_all.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| if x.id == y.id { std::cmp::Ordering::Equal } else { unpack(y.id).cmp(unpack(x.id)) }));
+                pc.extend(pc_all.iter().map(|c| (c.ts, c.camp, c.id)));
             }
-            let pc: &[Ck] = &pc_all[..w];
+            let pc: &[(i64, u32, u64)] = &pc;
             starts.clear(); runs.clear();
 
             let name = unpack(ev[i].name);
@@ -1536,8 +1553,8 @@ fn main() {
                 }
                 d_sessions += 1; d_events += n; d_rev += rev;
                 starts.push(start);
-                while cptr < pc.len() && pc[cptr].ts <= start { cptr += 1; }
-                let c = if cptr > 0 && start - pc[cptr - 1].ts <= WEEK_MS { pc[cptr - 1].camp as usize } else { 0 };
+                while cptr < pc.len() && pc[cptr].0 <= start { cptr += 1; }
+                let c = if cptr > 0 && start - pc[cptr - 1].0 <= WEEK_MS { pc[cptr - 1].1 as usize } else { 0 };
                 let cell = &mut camp[c * ndays + day];
                 cell[0] += 1; cell[1] += (rev > 0) as i64; cell[2] += rev;
             }
@@ -1546,7 +1563,7 @@ fn main() {
             // assists: per campaign, merge the [click, click + 7 days] spans and count the sessions inside, by day
             if !pc.is_empty() {
                 ct.clear();
-                ct.extend(pc.iter().map(|c| (c.camp, c.ts)));
+                ct.extend(pc.iter().map(|c| (c.1, c.0)));
                 ct.sort_unstable();
                 let mut a = 0;
                 while a < ct.len() {
