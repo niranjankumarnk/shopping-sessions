@@ -1227,8 +1227,8 @@ fn release_pages<T>(v: &Vec<T>) {
 // ============================================================================================
 // DIAGNOSTIC BUILD. This branch is not an entry. Run without SS_CHILD it measures the machine it
 // is on and prints environment facts and timings to stderr, never a value from the data files.
-// It then leaves a campaign table that is wrong on purpose (one count is one too high) and exits
-// normally, so the public dev-set check fails and returns the log. It reads only /data.
+// It then removes its output and exits with status 1, so the public dev-set check fails as a
+// crashed run and returns the log. It reads only /data.
 // ============================================================================================
 fn slurp(path: &str) -> String {
     std::fs::read_to_string(path).map(|s| s.trim().replace('\n', " | ")).unwrap_or_else(|e| format!("<{}>", e.kind()))
@@ -1416,11 +1416,12 @@ fn diag_parent() -> ! {
                 len >> 20, r * 1e3, a * 1e3, f1.0 - f0.0, b * 1e3, c * 1e3);
         }
     }
-    // Last: one more normal run whose campaign table is off by one in a single count. That is the
-    // output this container leaves, so the dev check fails as a wrong table and returns this log.
-    diag_child("dev wrong-on-purpose", &[("SS_WRONG", "1")], &[]);
-    eprintln!("D ==== end of diagnostics after {:.1} s; the campaign table left behind is wrong on purpose ====", t0.elapsed().as_secs_f64());
-    std::process::exit(0);
+    // leave no output behind: this run must not pass as an entry
+    let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
+    let _ = std::fs::remove_dir_all(out.join("user_daily"));
+    let _ = std::fs::remove_dir_all(out.join("campaign_daily"));
+    eprintln!("D ==== end of diagnostics after {:.1} s; output removed; exiting with status 1 on purpose ====", t0.elapsed().as_secs_f64());
+    std::process::exit(1);
 }
 
 fn main() {
@@ -1965,7 +1966,6 @@ fn main() {
 
     let mut camp = vec![[0i64; 4]; ncamp * ndays];
     for cell in camp_acc.0 { for (a, b) in camp.iter_mut().zip(cell.into_inner()) { for q in 0..4 { a[q] += b[q]; } } }
-    if std::env::var_os("SS_WRONG").is_some() { camp[0][0] += 1; } // diagnostic build: fail the dev check on purpose
     let (mut cid, mut chan, mut cday) = (Vec::new(), Vec::new(), Vec::new());
     let mut c4: [Vec<u8>; 4] = Default::default();
     let mut crows = 0usize;
