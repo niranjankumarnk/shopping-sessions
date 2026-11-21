@@ -956,7 +956,32 @@ impl ChunkOut {
         if hi > lo { out.push((unsafe { self.base.add(lo) }, hi - lo)); }
     }
 }
+/// The survivors of one dedup group, ordered by person partition and written back over the
+/// group's own parsed events (32-byte records where 40-byte ones were), so they need no memory
+/// of their own. Partition p is records `part_off[p] .. part_off[p + 1]` of the regions laid end
+/// to end; region r starts at record `starts[r]`. `first[p]` is where partition p begins, how
+/// many of its records lie there before the region ends, and how many it has in all.
+struct GroupOut { part_off: Vec<u32>, starts: Vec<u32>, ptrs: Vec<*const Sv>, first: Vec<(*const Sv, u32, u32)> }
+unsafe impl Send for GroupOut {}
+unsafe impl Sync for GroupOut {}
+impl GroupOut {
+    /// Appends records `pos .. hi` of this group to `out`.
+    #[inline(never)]
+    fn copy_range(&self, mut pos: u32, hi: u32, out: &mut Vec<Sv>) {
+        if pos == hi { return; }
+        let mut r = self.starts.partition_point(|&s| s <= pos) - 1;
+        while pos < hi {
+            let end = hi.min(self.starts[r + 1]);
+            let src = unsafe { self.ptrs[r].add((pos - self.starts[r]) as usize) };
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, (end - pos) as usize) });
+            pos = end;
+            r += 1;
+        }
+    }
+}
 thread_local! {
+    /// Per-thread buffer for one dedup group's survivors, reused group after group.
+    static SURVIVORS: std::cell::RefCell<Vec<Sv>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Per-thread staging for one chunk's events and their bucket numbers, reused chunk after chunk.
     static STAGE: std::cell::RefCell<(Vec<Ev>, Vec<u16>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
@@ -1244,15 +1269,17 @@ fn main() {
     lap(&format!("links ready: {} slots", links.slots.len()));
 
     // ---- dedup each bucket, resolve people, count survivors per person partition
-    let groups = (threads * 8).min(nb);
+    // groups of buckets: about 250,000 events each, so a group's survivors fit a few megabytes
+    let groups = (est_events / 250_000).next_power_of_two().clamp(64, 256).min(nb);
     let per_group = nb / groups; // both are powers of two or nb is a multiple: nb >= 64 and threads*8 may not divide
     let groups = nb.div_ceil(per_group);
-    let counts: Vec<Vec<u32>> = (0..groups).into_par_iter().map(|g| {
+    let group_out: Vec<GroupOut> = (0..groups).into_par_iter().map(|g| {
+        let (b_lo, b_hi) = (g * per_group, ((g + 1) * per_group).min(nb));
         let mut cnt = vec![0u32; np];
         let mut table: Vec<u64> = Vec::new();
         let mut refs: Vec<*mut Ev> = Vec::new();
         let mut lists: Vec<(*mut Ev, usize)> = Vec::new();
-        for b in (g * per_group)..((g + 1) * per_group).min(nb) {
+        for b in b_lo..b_hi {
             // this group is the only one touching bucket b of every chunk
             lists.clear();
             for c in &parsed { c.pieces(b, &mut lists); }
@@ -1309,47 +1336,62 @@ fn main() {
                 }
             }
         }
-        cnt
-    }).collect();
-
-    // ---- scatter survivors into one array, grouped by person partition
-    let scatter_offsets = |counts: &Vec<Vec<u32>>| -> (Vec<usize>, Vec<Vec<usize>>) {
-        let mut base = vec![0usize; np + 1];
-        for c in counts { for p in 0..np { base[p + 1] += c[p] as usize; } }
-        for p in 0..np { base[p + 1] += base[p]; }
-        let mut run = base.clone();
-        let offs = counts.iter().map(|c| {
-            let o: Vec<usize> = run[..np].to_vec();
-            for p in 0..np { run[p] += c[p] as usize; }
-            o
-        }).collect();
-        (base, offs)
-    };
-    let (ev_base, ev_offs) = scatter_offsets(&counts);
-    let total_ev = ev_base[np];
-    let mut evs: Vec<Sv> = Vec::with_capacity(total_ev);
-    advise_huge(&evs);
-    note_vec(&evs);
-    unsafe { evs.set_len(total_ev); }
-    let evs_ptr = Raw(evs.as_mut_ptr());
-    ev_offs.into_par_iter().enumerate().for_each(|(g, mut off)| {
-        let mut lists: Vec<(*mut Ev, usize)> = Vec::new();
-        for b in (g * per_group)..((g + 1) * per_group).min(nb) {
+        // The group's survivors, ordered by partition, into this thread's buffer ...
+        let mut part_off = vec![0u32; np + 1];
+        for p in 0..np { part_off[p + 1] = part_off[p] + cnt[p]; }
+        let total = part_off[np] as usize;
+        // one group at a time per thread, and nothing below re-enters this closure
+        let buf = unsafe { &mut *SURVIVORS.with(|s| s.as_ptr()) };
+        buf.clear();
+        buf.reserve(total);
+        let out = buf.as_mut_ptr();
+        let mut next: Vec<u32> = part_off[..np].to_vec();
+        for b in b_lo..b_hi {
             lists.clear();
             for c in &parsed { c.pieces(b, &mut lists); }
             for &(ptr, len) in &lists {
                 for e in unsafe { std::slice::from_raw_parts(ptr as *const Ev, len) } {
                     if e.tp == DEAD_TP { continue; }
-                    let p = pbucket(e.user, np_mask);
+                    let slot = unsafe { next.get_unchecked_mut(pbucket(e.user, np_mask)) };
                     let (ts, price) = (ws + (e.tp >> PRICE_BITS) as i64, (e.tp & ((1 << PRICE_BITS) - 1)) as u32);
-                    unsafe { evs_ptr.get().add(off[p]).write(Sv { pk: e.user, ts, name: e.name, price, cat: e.cat as u32 }); }
-                    off[p] += 1;
+                    unsafe { out.add(*slot as usize).write(Sv { pk: e.user, ts, name: e.name, price, cat: e.cat as u32 }); }
+                    *slot += 1;
                 }
             }
         }
-    });
-    // Give the blocks' pages back on all threads now; left for exit they are torn down by one.
-    parsed.into_par_iter().for_each(|c| { release_pages(&c.block); drop(c); });
+        // ... and back over the group's own events, which are dead now: chunk by chunk, as many
+        // 32-byte records as fit where that chunk's 40-byte ones were.
+        let (mut starts, mut ptrs, mut done) = (vec![0u32], Vec::new(), 0usize);
+        for c in &parsed {
+            if done == total { break; }
+            let (lo, hi) = (c.offs[b_lo] as usize, c.offs[b_hi] as usize);
+            let k = ((hi - lo) * std::mem::size_of::<Ev>() / std::mem::size_of::<Sv>()).min(total - done);
+            if k == 0 { continue; }
+            let dst = unsafe { c.base.add(lo) } as *mut Sv;
+            unsafe { std::ptr::copy_nonoverlapping(out.add(done) as *const Sv, dst, k); }
+            ptrs.push(dst as *const Sv);
+            done += k;
+            starts.push(done as u32);
+        }
+        assert!(done == total);
+        // where each partition begins
+        let mut first: Vec<(*const Sv, u32, u32)> = Vec::with_capacity(np);
+        let mut r = 0usize;
+        for p in 0..np {
+            let (lo, hi) = (part_off[p], part_off[p + 1]);
+            if lo == hi { first.push((std::ptr::null(), 0, 0)); continue; }
+            while starts[r + 1] <= lo { r += 1; }
+            first.push((unsafe { ptrs[r].add((lo - starts[r]) as usize) }, (starts[r + 1] - lo).min(hi - lo), hi - lo));
+        }
+        GroupOut { part_off, starts, ptrs, first }
+    }).collect();
+    rayon::broadcast(|_| { let b = unsafe { &mut *SURVIVORS.with(|s| s.as_ptr()) }; release_pages(b); });
+    // The parsed blocks now hold the survivors and are read until the output is written; their
+    // pages go back with the other large regions just before exit.
+    for c in &parsed { note_vec(&c.block); }
+    std::mem::forget(parsed);
+    let part_size: Vec<usize> = (0..np).into_par_iter().map(|p| group_out.iter().map(|g| (g.part_off[p + 1] - g.part_off[p]) as usize).sum()).collect();
+    let total_ev: usize = part_size.iter().sum();
     lap(&format!("events deduped: {} survive", total_ev));
 
     // ---- clicks: parse, validate, resolve people; copies are identical, so dedup happens after the sort
@@ -1363,6 +1405,18 @@ fn main() {
         if fast { return unsafe { parse_clicks_fast(part, &ck_ctx) }; }
         parse_clicks::<false>(part, &ck_ctx)
     }).collect();
+    let scatter_offsets = |counts: &Vec<Vec<u32>>| -> (Vec<usize>, Vec<Vec<usize>>) {
+        let mut base = vec![0usize; np + 1];
+        for c in counts { for p in 0..np { base[p + 1] += c[p] as usize; } }
+        for p in 0..np { base[p + 1] += base[p]; }
+        let mut run = base.clone();
+        let offs = counts.iter().map(|c| {
+            let o: Vec<usize> = run[..np].to_vec();
+            for p in 0..np { run[p] += c[p] as usize; }
+            o
+        }).collect();
+        (base, offs)
+    };
     let ck_counts: Vec<Vec<u32>> = ck_parsed.iter().map(|x| x.1.clone()).collect();
     let (ck_base, ck_offs) = scatter_offsets(&ck_counts);
     let total_ck = ck_base[np];
@@ -1386,9 +1440,27 @@ fn main() {
     // Largest partitions first, one task each: a whale person is a long single-threaded job, and
     // started last it would leave the other threads idle at the end.
     let mut order: Vec<usize> = (0..np).collect();
-    order.sort_unstable_by_key(|&b| std::cmp::Reverse(ev_base[b + 1] - ev_base[b]));
+    order.sort_unstable_by_key(|&b| std::cmp::Reverse(part_size[b]));
     let parts: Vec<PartOut> = order.par_iter().with_max_len(1).map(|&b| {
-        let ev: &mut [Sv] = unsafe { std::slice::from_raw_parts_mut(evs_ptr.get().add(ev_base[b]), ev_base[b + 1] - ev_base[b]) };
+        // This partition's survivors: a piece from every dedup group, each somewhere else in
+        // memory, so the next few pieces are requested while one is copied.
+        let mut ev: Vec<Sv> = Vec::with_capacity(part_size[b]);
+        let pieces: Vec<(*const Sv, u32, u32)> = group_out.iter().map(|g| g.first[b]).collect();
+        const PIECES_AHEAD: usize = 6;
+        for (k, &(ptr, here, all)) in pieces.iter().enumerate() {
+            if k + PIECES_AHEAD < pieces.len() {
+                let f = pieces[k + PIECES_AHEAD].0 as *const u8;
+                prefetch(f);
+                prefetch(f.wrapping_add(64));
+                prefetch(f.wrapping_add(128));
+            }
+            if all == 0 { continue; }
+            ev.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, here as usize) });
+            if here < all {
+                let g = &group_out[k];
+                g.copy_range(g.part_off[b] + here, g.part_off[b + 1], &mut ev);
+            }
+        }
         let ck_all: &mut [Ck] = unsafe { std::slice::from_raw_parts_mut(cks_ptr.get().add(ck_base[b]), ck_base[b + 1] - ck_base[b]) };
         // each rayon worker owns one accumulator
         let camp: &mut Vec<[i64; 4]> = camp_acc.mine();
