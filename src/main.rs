@@ -23,7 +23,6 @@ use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 const DAY_MS: i64 = 86_400_000;
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 604_800_000;
-const DEAD: i64 = i64::MIN;
 const NO_CAT: u32 = u32::MAX;
 
 #[derive(Default)]
@@ -82,7 +81,11 @@ fn unpack(v: u64) -> &'static [u8] {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Ev { eid: u64, user: u64, name: u64, ts: i64, eid2: u32, ingest: i32, price: u32, cat: u32 }
+struct Ev { eid: u64, user: u64, name: u64, tp: u64, ingest: i32, cat: u16, eid2: u16 }
+// `tp` packs the time since window_start (40 bits of milliseconds) above the price (24 bits);
+// all ones marks an event that is invalid or lost its dedup.
+const DEAD_TP: u64 = u64::MAX;
+const PRICE_BITS: u32 = 24;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Sv { pk: u64, ts: i64, name: u64, price: u32, cat: u32 }
@@ -787,22 +790,22 @@ fn put_str(v: &mut Vec<u8>, s: &[u8]) {
     v.extend_from_slice(s);
 }
 
-/// The events of one parsed chunk, grouped by dedup bucket inside a single block: bucket b owns
-/// slots `b * est .. b * est + lens[b]`. A bucket that fills its slots spills into `over[b]`.
-struct ChunkOut { base: *mut Ev, _block: Vec<Ev>, lens: Vec<u32>, over: Vec<Vec<Ev>>, est: usize }
+/// The events of one parsed chunk in one exactly sized block, sorted by dedup bucket:
+/// bucket b is `offs[b] .. offs[b + 1]`.
+struct ChunkOut { base: *mut Ev, block: Vec<Ev>, offs: Vec<u32> }
 unsafe impl Send for ChunkOut {}
 unsafe impl Sync for ChunkOut {}
 impl ChunkOut {
-    /// Appends the pieces of bucket `b` as (pointer, length).
+    /// Appends bucket `b` as (pointer, length) unless it is empty.
     #[inline(always)]
     fn pieces(&self, b: usize, out: &mut Vec<(*mut Ev, usize)>) {
-        let n = self.lens[b] as usize;
-        if n > 0 { out.push((unsafe { self.base.add(b * self.est) }, n)); }
-        if !self.over.is_empty() {
-            let v = &self.over[b];
-            if !v.is_empty() { out.push((v.as_ptr() as *mut Ev, v.len())); }
-        }
+        let (lo, hi) = (self.offs[b] as usize, self.offs[b + 1] as usize);
+        if hi > lo { out.push((unsafe { self.base.add(lo) }, hi - lo)); }
     }
+}
+thread_local! {
+    /// Per-thread staging for one chunk's events and their bucket numbers, reused chunk after chunk.
+    static STAGE: std::cell::RefCell<(Vec<Ev>, Vec<u16>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// One person partition's user_daily rows, already PLAIN-encoded per column.
@@ -859,6 +862,20 @@ fn advise_huge<T>(v: &Vec<T>) {
         let a = (start + 4095) & !4095;
         let b = (start + len) & !4095;
         if b > a + (4 << 20) { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_HUGEPAGE); }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = v;
+}
+
+/// Returns the pages behind a buffer to the kernel now, from the calling thread, while keeping
+/// the buffer itself valid (it reads as zeros afterwards).
+fn release_pages<T>(v: &Vec<T>) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let (start, len) = (v.as_ptr() as usize, v.capacity() * std::mem::size_of::<T>());
+        let a = (start + 4095) & !4095;
+        let b = (start + len) & !4095;
+        if b > a { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_DONTNEED); }
     }
     #[cfg(not(target_os = "linux"))]
     let _ = v;
@@ -938,29 +955,32 @@ fn main() {
     let ev_files = map_dir(&data.join("events"));
     let ev_bytes: usize = ev_files.iter().map(|d| d.len()).sum();
     let est_events = ev_bytes / 85 + 1;
-    let nb = (est_events / 16_000).next_power_of_two().clamp(64, 4096); // dedup buckets, sized to stay in cache
+    // SS_NB and SS_NP force the bucket and partition counts, to test a large-data layout on small data
+    let knob = |k: &str| std::env::var(k).ok().and_then(|x| x.parse::<usize>().ok()).filter(|n| n.is_power_of_two() && *n >= 2 && *n <= 4096);
+    let nb = knob("SS_NB").unwrap_or((est_events / 16_000).next_power_of_two().clamp(64, 4096)); // dedup buckets, sized to stay in cache
     let nb_shift = 64 - nb.trailing_zeros();
-    let np = (est_events / 20_000).next_power_of_two().clamp(16, 4096); // person partitions
+    let np = knob("SS_NP").unwrap_or((est_events / 20_000).next_power_of_two().clamp(16, 4096)); // person partitions
+    assert!(we - ws < 1i64 << 40 && we >= ws, "window too long for the packed timestamp");
+    assert!(cats.len() <= u16::MAX as usize, "too many categories for the packed record");
     let np_mask = (np - 1) as u64;
     let pbucket = move |pk: u64| -> usize { ((pk >> 40) & np_mask) as usize };
     let chunk = (ev_bytes / (threads * 8)).clamp(1 << 20, 16 << 20);
     let ev_parts: Vec<&'static [u8]> = ev_files.iter().flat_map(|d| chunks(d, chunk)).collect();
-    let parsed: Vec<ChunkOut> = ev_parts.par_iter().map(|part| {
-        // slots per bucket: the expected count plus four standard deviations
-        let mean = part.len() / 70 / nb;
-        let est = mean + 4 * ((mean as f64).sqrt() as usize) + 8;
-        let mut block: Vec<Ev> = Vec::with_capacity(nb * est);
-        advise_huge(&block);
-        let base = block.as_mut_ptr();
-        let mut lens = vec![0u32; nb];
-        let mut over: Vec<Vec<Ev>> = Vec::new();
+    let parsed: Vec<ChunkOut> = ev_parts.par_iter().map(|part| STAGE.with(|stage| {
+        // Stage the chunk's events in arrival order, counting per bucket, then place them in a block
+        // of exactly the right size. Nothing is reserved that is not used.
+        let mut stage = stage.borrow_mut();
+        let (staged, buckets) = &mut *stage;
+        staged.clear();
+        buckets.clear();
+        let mut offs = vec![0u32; nb + 1];
         let mut dc = DateCache::new();
         scan_lines::<7>(part, |[id, user, ts, ingest, ty, product, price]| {
             if id.is_empty() { return; }
             let h = xxh3_128(id);
             let hi = (h >> 64) as u64;
             let ingest_ms = parse_ts(ingest, &mut dc);
-            let mut e = Ev { eid: h as u64, user: 0, name: 0, ts: DEAD, eid2: hi as u32, ingest: i32::MIN, price: 0, cat: 0 };
+            let mut e = Ev { eid: h as u64, user: 0, name: 0, tp: DEAD_TP, ingest: i32::MIN, cat: 0, eid2: hi as u16 };
             if let Some(ing) = ingest_ms {
                 e.ingest = ((ing - ws).div_euclid(1000)).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32;
             }
@@ -970,33 +990,41 @@ fn main() {
                 if t < ws || t >= we { return; }
                 let Some(ing) = ingest_ms else { return };
                 if ing - t > DAY_MS { return; }
+                let mut cents = 0u32;
                 match ty {
                     b"view" | b"cart" => {}
                     b"purchase" => {
                         let Some(p) = parse_price(price) else { return };
-                        e.price = p;
-                        e.cat = products.get(&xxh3_64(product)).copied().unwrap_or(0);
+                        cents = p;
+                        e.cat = products.get(&xxh3_64(product)).copied().unwrap_or(0) as u16;
                     }
                     _ => return,
                 }
                 e.user = xxh3_64(user);
                 e.name = pack(user);
-                e.ts = t;
+                e.tp = (((t - ws) as u64) << PRICE_BITS) | cents as u64;
             })();
             let b = (hi >> nb_shift) as usize;
-            let n = unsafe { *lens.get_unchecked(b) } as usize;
-            if n < est {
-                unsafe {
-                    base.add(b * est + n).write(e);
-                    *lens.get_unchecked_mut(b) = n as u32 + 1;
-                }
-            } else {
-                if over.is_empty() { over.resize_with(nb, Vec::new); }
-                over[b].push(e);
-            }
+            unsafe { *offs.get_unchecked_mut(b + 1) += 1; }
+            staged.push(e);
+            buckets.push(b as u16);
         });
-        ChunkOut { base, _block: block, lens, over, est }
-    }).collect();
+        for b in 0..nb { offs[b + 1] += offs[b]; }
+        let n = staged.len();
+        let mut block: Vec<Ev> = Vec::with_capacity(n.max(1));
+        advise_huge(&block);
+        let base = block.as_mut_ptr();
+        let mut next: Vec<u32> = offs[..nb].to_vec();
+        for (e, &b) in staged.iter().zip(buckets.iter()) {
+            unsafe {
+                let slot = next.get_unchecked_mut(b as usize);
+                base.add(*slot as usize).write(*e);
+                *slot += 1;
+            }
+        }
+        unsafe { block.set_len(n); }
+        ChunkOut { base, block, offs }
+    })).collect();
     lap(&format!("events parsed ({} dedup buckets, {} person partitions)", nb, np));
 
     let links = links_thread.join().unwrap();
@@ -1033,7 +1061,7 @@ fn main() {
                         if t >> 32 == tag {
                             let o = unsafe { &mut *refs[(t as u32 - 1) as usize] };
                             if o.eid == e.eid && o.eid2 == e.eid2 {
-                                if e.ingest < o.ingest { o.ts = DEAD; table[s] = (tag << 32) | i; } else { e.ts = DEAD; }
+                                if e.ingest < o.ingest { o.tp = DEAD_TP; table[s] = (tag << 32) | i; } else { e.tp = DEAD_TP; }
                                 break;
                             }
                         }
@@ -1044,10 +1072,10 @@ fn main() {
             }
             // resolve the survivors to people, a block at a time so the table probes can be prefetched
             for blk in refs.chunks(32) {
-                for &r in blk { let e = unsafe { &*r }; if e.ts != DEAD { prefetch(links.slot(e.user)); } }
+                for &r in blk { let e = unsafe { &*r }; if e.tp != DEAD_TP { prefetch(links.slot(e.user)); } }
                 for &r in blk {
                     let e = unsafe { &mut *r };
-                    if e.ts == DEAD { continue; }
+                    if e.tp == DEAD_TP { continue; }
                     let (pk, name) = links.person(e.user, e.name);
                     e.user = pk;
                     e.name = name;
@@ -1085,16 +1113,17 @@ fn main() {
             for c in &parsed { c.pieces(b, &mut lists); }
             for &(ptr, len) in &lists {
                 for e in unsafe { std::slice::from_raw_parts(ptr as *const Ev, len) } {
-                    if e.ts == DEAD { continue; }
+                    if e.tp == DEAD_TP { continue; }
                     let p = pbucket(e.user);
-                    unsafe { evs_ptr.get().add(off[p]).write(Sv { pk: e.user, ts: e.ts, name: e.name, price: e.price, cat: e.cat }); }
+                    let (ts, price) = (ws + (e.tp >> PRICE_BITS) as i64, (e.tp & ((1 << PRICE_BITS) - 1)) as u32);
+                    unsafe { evs_ptr.get().add(off[p]).write(Sv { pk: e.user, ts, name: e.name, price, cat: e.cat as u32 }); }
                     off[p] += 1;
                 }
             }
         }
     });
-    // hand the blocks back to the allocator on all threads: the later stages reuse the memory
-    parsed.into_par_iter().for_each(drop);
+    // Give the blocks' pages back on all threads now; left for exit they are torn down by one.
+    parsed.into_par_iter().for_each(|c| { release_pages(&c.block); drop(c); });
     lap(&format!("events deduped: {} survive", total_ev));
 
     // ---- clicks: parse, validate, resolve people; copies are identical, so dedup happens after the sort
