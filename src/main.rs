@@ -184,13 +184,33 @@ const MASK_SHIFT: u32 = 0;
 #[inline(always)]
 unsafe fn delim_masks(_: *const u8) -> (u64, u64) { (0, 0) }
 
+/// The same two masks from two 32-byte loads. Only called from code compiled for AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn wide_masks(p: *const u8) -> (u64, u64) {
+    use core::arch::x86_64::*;
+    let (c, n, q) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+    let v0 = _mm256_loadu_si256(p as *const __m256i);
+    let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let d0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, c), _mm256_cmpeq_epi8(v0, n));
+    let d1 = _mm256_or_si256(_mm256_cmpeq_epi8(v1, c), _mm256_cmpeq_epi8(v1, n));
+    let dm = (_mm256_movemask_epi8(d0) as u32 as u64) | ((_mm256_movemask_epi8(d1) as u32 as u64) << 32);
+    let qm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, q)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, q)) as u32 as u64) << 32);
+    (dm, qm)
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn wide_masks(p: *const u8) -> (u64, u64) { delim_masks(p) }
+
 /// Calls `f` with the N fields of every well-formed line of `data`, whole-field quotes stripped.
+/// `WIDE` picks the AVX2 masks; it may only be true inside code compiled for AVX2 (see `fast_cpu`).
 /// Same rules as `split_line`. Only commas and newlines are visited one by one; quotes are counted
 /// per line, and a line is well formed when every quote is the first or last byte of a field that
 /// both starts and ends with one: quotes in the line == 2 x such fields.
 #[inline(always)]
 #[allow(unused_assignments)]
-fn scan_lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+fn scan_lines<'a, const N: usize, const WIDE: bool>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     let len = data.len();
     let ptr = data.as_ptr();
     let mut cuts = [0usize; 9];
@@ -225,7 +245,7 @@ fn scan_lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut([&'a [u8]; N
     }
     let mut pos = 0usize;
     while pos + BLOCK <= len {
-        let (mut m, qm) = unsafe { delim_masks(ptr.add(pos)) };
+        let (mut m, qm) = unsafe { if WIDE { wide_masks(ptr.add(pos)) } else { delim_masks(ptr.add(pos)) } };
         while m != 0 {
             let t = m.trailing_zeros();
             let i = pos + (t >> MASK_SHIFT) as usize;
@@ -473,6 +493,8 @@ mod tests {
     #[test]
     fn scanner_matches_split_line() {
         let mut r = Rng(42);
+        #[allow(unused_mut, unused_variables)]
+        let mut wide_runs = 0u64;
         let alphabet = b"ab,,,\"\"\n\n1 \r";
         for _ in 0..200_000 {
             let n = r.below(200) as usize;
@@ -481,7 +503,20 @@ mod tests {
                 let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
                 let mut want: Vec<Vec<Vec<u8>>> = Vec::new();
                 macro_rules! run { ($n:literal) => {{
-                    scan_lines::<$n>(&data, |f| got.push(f.iter().map(|x| x.to_vec()).collect()));
+                    scan_lines::<$n, false>(&data, |f| got.push(f.iter().map(|x| x.to_vec()).collect()));
+                    if fast_cpu() {
+                        let mut wide: Vec<Vec<Vec<u8>>> = Vec::new();
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
+                            unsafe fn go(data: &[u8], wide: &mut Vec<Vec<Vec<u8>>>) { scan_lines::<$n, true>(data, |f| wide.push(f.iter().map(|x| x.to_vec()).collect())); }
+                            unsafe { go(&data, &mut wide) };
+                            wide_runs += 1;
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        scan_lines::<$n, true>(&data, |f| wide.push(f.iter().map(|x| x.to_vec()).collect()));
+                        assert_eq!(wide, got, "wide {:?}", String::from_utf8_lossy(&data));
+                    }
                     let mut pos = 0;
                     while pos < data.len() { if let Some(f) = split_line::<$n>(&data, &mut pos) { want.push(f.iter().map(|x| x.to_vec()).collect()); } }
                 }}; }
@@ -592,7 +627,7 @@ fn build_links(dir: PathBuf) -> LinkTab {
     let parts: Vec<&'static [u8]> = files.iter().flat_map(|d| chunks(d, 4 << 20)).collect();
     let pairs: Vec<Vec<[u64; 4]>> = parts.par_iter().map(|part| {
         let mut v = Vec::with_capacity(part.len() / 16 + 4);
-        scan_lines::<2>(part, |[a, b]| {
+        scan_lines::<2, false>(part, |[a, b]| {
             if a.is_empty() || b.is_empty() { return; }
             v.push([xxh3_64(a), pack(a), xxh3_64(b), pack(b)]);
         });
@@ -808,6 +843,117 @@ thread_local! {
     static STAGE: std::cell::RefCell<(Vec<Ev>, Vec<u16>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
+/// True when the CPU has what the fast parsers are compiled for (and SS_BASELINE is not set).
+fn fast_cpu() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return std::env::var_os("SS_BASELINE").is_none()
+            && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi1")
+            && is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("popcnt");
+    }
+    #[allow(unreachable_code)]
+    false
+}
+#[inline(always)]
+fn pbucket(pk: u64, np_mask: u64) -> usize { ((pk >> 40) & np_mask) as usize }
+
+struct EvCtx<'a> { nb: usize, nb_shift: u32, ws: i64, we: i64, products: &'a IdMap<u32> }
+/// Parses one chunk of an events file into a block sorted by dedup bucket.
+#[inline(always)]
+fn parse_events<const WIDE: bool>(part: &[u8], c: &EvCtx) -> ChunkOut {
+    // Stage the chunk's events in arrival order, counting per bucket, then place them in a block
+    // of exactly the right size. Nothing is reserved that is not used.
+    let (nb, nb_shift, ws, we) = (c.nb, c.nb_shift, c.ws, c.we);
+    // one chunk at a time per thread, and nothing below re-enters this function
+    let (staged, buckets) = unsafe { &mut *STAGE.with(|s| s.as_ptr()) };
+    staged.clear();
+    buckets.clear();
+    let mut offs = vec![0u32; nb + 1];
+    let mut dc = DateCache::new();
+    scan_lines::<7, WIDE>(part, |[id, user, ts, ingest, ty, product, price]| {
+        if id.is_empty() { return; }
+        let h = xxh3_128(id);
+        let hi = (h >> 64) as u64;
+        let ingest_ms = parse_ts(ingest, &mut dc);
+        let mut e = Ev { eid: h as u64, user: 0, name: 0, tp: DEAD_TP, ingest: i32::MIN, cat: 0, eid2: hi as u16 };
+        if let Some(ing) = ingest_ms {
+            e.ingest = ((ing - ws).div_euclid(1000)).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32;
+        }
+        (|| {
+            if user.is_empty() || product.is_empty() { return; }
+            let Some(t) = parse_ts(ts, &mut dc) else { return };
+            if t < ws || t >= we { return; }
+            let Some(ing) = ingest_ms else { return };
+            if ing - t > DAY_MS { return; }
+            let mut cents = 0u32;
+            match ty {
+                b"view" | b"cart" => {}
+                b"purchase" => {
+                    let Some(p) = parse_price(price) else { return };
+                    cents = p;
+                    e.cat = c.products.get(&xxh3_64(product)).copied().unwrap_or(0) as u16;
+                }
+                _ => return,
+            }
+            e.user = xxh3_64(user);
+            e.name = pack(user);
+            e.tp = (((t - ws) as u64) << PRICE_BITS) | cents as u64;
+        })();
+        let b = (hi >> nb_shift) as usize;
+        unsafe { *offs.get_unchecked_mut(b + 1) += 1; }
+        staged.push(e);
+        buckets.push(b as u16);
+    });
+    for b in 0..nb { offs[b + 1] += offs[b]; }
+    let n = staged.len();
+    let mut block: Vec<Ev> = Vec::with_capacity(n.max(1));
+    advise_huge(&block);
+    let base = block.as_mut_ptr();
+    let mut next: Vec<u32> = offs[..nb].to_vec();
+    for (e, &b) in staged.iter().zip(buckets.iter()) {
+        unsafe {
+            let slot = next.get_unchecked_mut(b as usize);
+            base.add(*slot as usize).write(*e);
+            *slot += 1;
+        }
+    }
+    unsafe { block.set_len(n); }
+    ChunkOut { base, block, offs }
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
+unsafe fn parse_events_fast(part: &[u8], c: &EvCtx) -> ChunkOut { parse_events::<true>(part, c) }
+
+struct CkCtx<'a> { ws: i64, we: i64, campaigns: &'a IdMap<u32>, camp_names: &'a [&'a [u8]], links: &'a LinkTab, np: usize, np_mask: u64 }
+/// Parses one chunk of a clicks file: the valid clicks with their person, and how many fall in
+/// each person partition.
+#[inline(always)]
+fn parse_clicks<const WIDE: bool>(part: &[u8], c: &CkCtx) -> (Vec<Ck>, Vec<u32>) {
+    let (ws, we) = (c.ws, c.we);
+    let mut v: Vec<Ck> = Vec::with_capacity(part.len() / 40 + 4);
+    let mut dc = DateCache::new();
+    scan_lines::<4, WIDE>(part, |[id, user, camp, ts]| {
+        if id.is_empty() || user.is_empty() { return; }
+        let Some(t) = parse_ts(ts, &mut dc) else { return };
+        if t < ws - WEEK_MS || t >= we { return; }
+        let Some(&k) = c.campaigns.get(&xxh3_64(camp)) else { return };
+        if c.camp_names[k as usize] != camp { return; }
+        v.push(Ck { pk: xxh3_64(user), ts: t, id: pack(id), camp: k, pad: 0 });
+    });
+    let mut cnt = vec![0u32; c.np];
+    for blk in v.chunks_mut(32) {
+        for k in blk.iter() { prefetch(c.links.slot(k.pk)); }
+        for k in blk.iter_mut() {
+            k.pk = c.links.person(k.pk, 1).0;
+            cnt[pbucket(k.pk, c.np_mask)] += 1;
+        }
+    }
+    (v, cnt)
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
+unsafe fn parse_clicks_fast(part: &[u8], c: &CkCtx) -> (Vec<Ck>, Vec<u32>) { parse_clicks::<true>(part, c) }
+
 /// One person partition's user_daily rows, already PLAIN-encoded per column.
 #[derive(Default)]
 struct PartOut { rows: usize, user: Vec<u8>, day: Vec<u8>, sess: Vec<u8>, evs: Vec<u8>, rev: Vec<u8>, bits: Vec<u8>, def: Vec<u8>, top: Vec<u8> }
@@ -963,69 +1109,16 @@ fn main() {
     assert!(we - ws < 1i64 << 40 && we >= ws, "window too long for the packed timestamp");
     assert!(cats.len() <= u16::MAX as usize, "too many categories for the packed record");
     let np_mask = (np - 1) as u64;
-    let pbucket = move |pk: u64| -> usize { ((pk >> 40) & np_mask) as usize };
     let chunk = (ev_bytes / (threads * 8)).clamp(1 << 20, 16 << 20);
     let ev_parts: Vec<&'static [u8]> = ev_files.iter().flat_map(|d| chunks(d, chunk)).collect();
-    let parsed: Vec<ChunkOut> = ev_parts.par_iter().map(|part| STAGE.with(|stage| {
-        // Stage the chunk's events in arrival order, counting per bucket, then place them in a block
-        // of exactly the right size. Nothing is reserved that is not used.
-        let mut stage = stage.borrow_mut();
-        let (staged, buckets) = &mut *stage;
-        staged.clear();
-        buckets.clear();
-        let mut offs = vec![0u32; nb + 1];
-        let mut dc = DateCache::new();
-        scan_lines::<7>(part, |[id, user, ts, ingest, ty, product, price]| {
-            if id.is_empty() { return; }
-            let h = xxh3_128(id);
-            let hi = (h >> 64) as u64;
-            let ingest_ms = parse_ts(ingest, &mut dc);
-            let mut e = Ev { eid: h as u64, user: 0, name: 0, tp: DEAD_TP, ingest: i32::MIN, cat: 0, eid2: hi as u16 };
-            if let Some(ing) = ingest_ms {
-                e.ingest = ((ing - ws).div_euclid(1000)).clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32;
-            }
-            (|| {
-                if user.is_empty() || product.is_empty() { return; }
-                let Some(t) = parse_ts(ts, &mut dc) else { return };
-                if t < ws || t >= we { return; }
-                let Some(ing) = ingest_ms else { return };
-                if ing - t > DAY_MS { return; }
-                let mut cents = 0u32;
-                match ty {
-                    b"view" | b"cart" => {}
-                    b"purchase" => {
-                        let Some(p) = parse_price(price) else { return };
-                        cents = p;
-                        e.cat = products.get(&xxh3_64(product)).copied().unwrap_or(0) as u16;
-                    }
-                    _ => return,
-                }
-                e.user = xxh3_64(user);
-                e.name = pack(user);
-                e.tp = (((t - ws) as u64) << PRICE_BITS) | cents as u64;
-            })();
-            let b = (hi >> nb_shift) as usize;
-            unsafe { *offs.get_unchecked_mut(b + 1) += 1; }
-            staged.push(e);
-            buckets.push(b as u16);
-        });
-        for b in 0..nb { offs[b + 1] += offs[b]; }
-        let n = staged.len();
-        let mut block: Vec<Ev> = Vec::with_capacity(n.max(1));
-        advise_huge(&block);
-        let base = block.as_mut_ptr();
-        let mut next: Vec<u32> = offs[..nb].to_vec();
-        for (e, &b) in staged.iter().zip(buckets.iter()) {
-            unsafe {
-                let slot = next.get_unchecked_mut(b as usize);
-                base.add(*slot as usize).write(*e);
-                *slot += 1;
-            }
-        }
-        unsafe { block.set_len(n); }
-        ChunkOut { base, block, offs }
-    })).collect();
-    lap(&format!("events parsed ({} dedup buckets, {} person partitions)", nb, np));
+    let fast = fast_cpu();
+    let ev_ctx = EvCtx { nb, nb_shift, ws, we, products: &products };
+    let parsed: Vec<ChunkOut> = ev_parts.par_iter().map(|part| {
+        #[cfg(target_arch = "x86_64")]
+        if fast { return unsafe { parse_events_fast(part, &ev_ctx) }; }
+        parse_events::<false>(part, &ev_ctx)
+    }).collect();
+    lap(&format!("events parsed ({} dedup buckets, {} person partitions, {} parser)", nb, np, if fast { "AVX2" } else { "baseline" }));
 
     let links = links_thread.join().unwrap();
     lap(&format!("links ready: {} slots", links.slots.len()));
@@ -1079,7 +1172,7 @@ fn main() {
                     let (pk, name) = links.person(e.user, e.name);
                     e.user = pk;
                     e.name = name;
-                    cnt[pbucket(pk)] += 1;
+                    cnt[pbucket(pk, np_mask)] += 1;
                 }
             }
         }
@@ -1114,7 +1207,7 @@ fn main() {
             for &(ptr, len) in &lists {
                 for e in unsafe { std::slice::from_raw_parts(ptr as *const Ev, len) } {
                     if e.tp == DEAD_TP { continue; }
-                    let p = pbucket(e.user);
+                    let p = pbucket(e.user, np_mask);
                     let (ts, price) = (ws + (e.tp >> PRICE_BITS) as i64, (e.tp & ((1 << PRICE_BITS) - 1)) as u32);
                     unsafe { evs_ptr.get().add(off[p]).write(Sv { pk: e.user, ts, name: e.name, price, cat: e.cat as u32 }); }
                     off[p] += 1;
@@ -1131,26 +1224,11 @@ fn main() {
     let ck_bytes: usize = ck_files.iter().map(|d| d.len()).sum();
     let ck_chunk = (ck_bytes / (threads * 8)).clamp(1 << 20, 16 << 20);
     let ck_parts: Vec<&'static [u8]> = ck_files.iter().flat_map(|d| chunks(d, ck_chunk)).collect();
+    let ck_ctx = CkCtx { ws, we, campaigns: &campaigns, camp_names: &camp_names, links: &links, np, np_mask };
     let ck_parsed: Vec<(Vec<Ck>, Vec<u32>)> = ck_parts.par_iter().map(|part| {
-        let mut v: Vec<Ck> = Vec::with_capacity(part.len() / 40 + 4);
-        let mut dc = DateCache::new();
-        scan_lines::<4>(part, |[id, user, camp, ts]| {
-            if id.is_empty() || user.is_empty() { return; }
-            let Some(t) = parse_ts(ts, &mut dc) else { return };
-            if t < ws - WEEK_MS || t >= we { return; }
-            let Some(&c) = campaigns.get(&xxh3_64(camp)) else { return };
-            if camp_names[c as usize] != camp { return; }
-            v.push(Ck { pk: xxh3_64(user), ts: t, id: pack(id), camp: c, pad: 0 });
-        });
-        let mut cnt = vec![0u32; np];
-        for blk in v.chunks_mut(32) {
-            for c in blk.iter() { prefetch(links.slot(c.pk)); }
-            for c in blk.iter_mut() {
-                c.pk = links.person(c.pk, 1).0;
-                cnt[pbucket(c.pk)] += 1;
-            }
-        }
-        (v, cnt)
+        #[cfg(target_arch = "x86_64")]
+        if fast { return unsafe { parse_clicks_fast(part, &ck_ctx) }; }
+        parse_clicks::<false>(part, &ck_ctx)
     }).collect();
     let ck_counts: Vec<Vec<u32>> = ck_parsed.iter().map(|x| x.1.clone()).collect();
     let (ck_base, ck_offs) = scatter_offsets(&ck_counts);
@@ -1162,7 +1240,7 @@ fn main() {
     let cks_ptr = Raw(cks.as_mut_ptr());
     ck_parsed.par_iter().zip(ck_offs.into_par_iter()).for_each(|((v, _), mut off)| {
         for c in v {
-            let p = pbucket(c.pk);
+            let p = pbucket(c.pk, np_mask);
             unsafe { cks_ptr.get().add(off[p]).write(*c); }
             off[p] += 1;
         }
