@@ -1253,36 +1253,49 @@ fn main() {
             table.clear();
             table.resize(cap, 0);
             refs.clear();
-            for &(ptr, len) in &lists {
-                for e in unsafe { std::slice::from_raw_parts_mut(ptr, len) } {
-                    let i = refs.len() as u64 + 1;
-                    let tag = e.eid >> 32;
-                    let mut s = e.eid as usize & mask;
-                    loop {
-                        let t = table[s];
-                        if t == 0 { table[s] = (tag << 32) | i; break; }
-                        if t >> 32 == tag {
-                            let o = unsafe { &mut *refs[(t as u32 - 1) as usize] };
-                            if o.eid == e.eid && o.eid2 == e.eid2 {
-                                if e.ingest < o.ingest { o.tp = DEAD_TP; table[s] = (tag << 32) | i; } else { e.tp = DEAD_TP; }
-                                break;
-                            }
-                        }
-                        s = (s + 1) & mask;
-                    }
-                    refs.push(e as *mut Ev);
+            // One pass over the bucket: resolve each valid event to its person, then enter it in
+            // the bucket's table. The link table is far too big for the cache, so its slot (and the
+            // bucket table's) is requested a fixed distance ahead. The partition counts follow the
+            // winners as they change.
+            for &(ptr, len) in &lists { for k in 0..len { refs.push(unsafe { ptr.add(k) }); } }
+            const AHEAD: usize = 24;
+            for k in 0..n {
+                if k + AHEAD < n {
+                    let f = unsafe { &**refs.get_unchecked(k + AHEAD) };
+                    if f.tp != DEAD_TP { prefetch(links.slot(f.user)); }
+                    prefetch(table.as_ptr().wrapping_add(f.eid as usize & mask));
                 }
-            }
-            // resolve the survivors to people, a block at a time so the table probes can be prefetched
-            for blk in refs.chunks(32) {
-                for &r in blk { let e = unsafe { &*r }; if e.tp != DEAD_TP { prefetch(links.slot(e.user)); } }
-                for &r in blk {
-                    let e = unsafe { &mut *r };
-                    if e.tp == DEAD_TP { continue; }
+                let e = unsafe { &mut **refs.get_unchecked(k) };
+                if e.tp != DEAD_TP {
                     let (pk, name) = links.person(e.user, e.name);
                     e.user = pk;
                     e.name = name;
-                    cnt[pbucket(pk, np_mask)] += 1;
+                }
+                let i = k as u64 + 1;
+                let tag = e.eid >> 32;
+                let mut s = e.eid as usize & mask;
+                loop {
+                    let t = table[s];
+                    if t == 0 {
+                        table[s] = (tag << 32) | i;
+                        if e.tp != DEAD_TP { cnt[pbucket(e.user, np_mask)] += 1; }
+                        break;
+                    }
+                    if t >> 32 == tag {
+                        let o = unsafe { &mut *refs[(t as u32 - 1) as usize] };
+                        if o.eid == e.eid && o.eid2 == e.eid2 {
+                            if e.ingest < o.ingest {
+                                // the earlier copy loses: uncount it if it was counted
+                                if o.tp != DEAD_TP { cnt[pbucket(o.user, np_mask)] -= 1; o.tp = DEAD_TP; }
+                                table[s] = (tag << 32) | i;
+                                if e.tp != DEAD_TP { cnt[pbucket(e.user, np_mask)] += 1; }
+                            } else {
+                                e.tp = DEAD_TP;
+                            }
+                            break;
+                        }
+                    }
+                    s = (s + 1) & mask;
                 }
             }
         }
