@@ -654,22 +654,35 @@ fn name_hash(key: u128, name: u64) -> u64 {
     if len <= 16 { xxh3_64(&key.to_be_bytes()[..len]) } else { xxh3_64(unpack(name)) }
 }
 
-/// Builds the link table. Runs on a side thread while the events are parsed. The one-thread part
-/// (numbering the IDs and joining them) works a small batch at a time so that its table and node
-/// reads can be prefetched; resolving every ID to its person and filling the table runs on all
-/// threads.
-fn build_links(dir: PathBuf) -> LinkTab {
+/// Builds the link table. Runs on a side thread while the events are parsed, with `helpers`
+/// threads of its own for the parts that split: the event parsing fills the shared pool, and a job
+/// handed to that pool would wait until the parsing is over. The one-thread part (numbering the
+/// IDs and joining them) works a small batch at a time so that its table and node reads can be
+/// prefetched.
+fn build_links(dir: PathBuf, helpers: usize) -> LinkTab {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let t0 = Instant::now();
-    let files = map_dir(&dir);
+    let files: Vec<&'static [u8]> = list_csv(&dir).iter().filter_map(|p| map_file(p)).collect();
     let parts: Vec<&'static [u8]> = files.iter().flat_map(|d| chunks(d, 4 << 20)).collect();
-    let pairs: Vec<Vec<Pair>> = parts.par_iter().map(|part| {
-        let mut v = Vec::with_capacity(part.len() / 16 + 4);
-        scan_lines::<2, false>(part, |[a, b]| {
-            if a.is_empty() || b.is_empty() { return; }
-            v.push(Pair { ka: prefix_key(a), kb: prefix_key(b), ha: xxh3_64(a), na: pack(a), hb: xxh3_64(b), nb: pack(b) });
-        });
-        v
-    }).collect();
+    let next_part = AtomicUsize::new(0);
+    let pairs: Vec<Vec<Pair>> = std::thread::scope(|sc| {
+        let workers: Vec<_> = (0..helpers.max(1)).map(|_| sc.spawn(|| {
+            let mut mine: Vec<Vec<Pair>> = Vec::new();
+            loop {
+                let i = next_part.fetch_add(1, Ordering::Relaxed);
+                if i >= parts.len() { break; }
+                let part = parts[i];
+                let mut v = Vec::with_capacity(part.len() / 16 + 4);
+                scan_lines::<2, false>(part, |[a, b]| {
+                    if a.is_empty() || b.is_empty() { return; }
+                    v.push(Pair { ka: prefix_key(a), kb: prefix_key(b), ha: xxh3_64(a), na: pack(a), hb: xxh3_64(b), nb: pack(b) });
+                });
+                mine.push(v);
+            }
+            mine
+        })).collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+    });
     let npairs: usize = pairs.iter().map(|v| v.len()).sum();
     let t_pairs = t0.elapsed().as_secs_f64();
 
@@ -737,7 +750,7 @@ fn build_links(dir: PathBuf) -> LinkTab {
     }
     let t_joined = t0.elapsed().as_secs_f64();
 
-    // ---- every ID -> (person key, person name), on all threads
+    // ---- every ID -> (person key, person name), on this stage's own threads
     let n = nodes.len();
     let tcap = (n * 2).next_power_of_two().max(16);
     let tmask = tcap - 1;
@@ -746,42 +759,61 @@ fn build_links(dir: PathBuf) -> LinkTab {
     note_vec(&slots);
     let slots_ptr = Raw(slots.as_mut_ptr());
     let (nodes_ref, keys_ref) = (&nodes, &keys);
-    const STEP: usize = 8192;
-    (0..n.div_ceil(STEP)).into_par_iter().for_each(|c| {
-        let (lo, hi) = (c * STEP, ((c + 1) * STEP).min(n));
-        let mut i = lo;
-        while i < hi {
-            let end = (i + BATCH).min(hi);
-            for k in i..end {
-                prefetch(nodes_ref.as_ptr().wrapping_add(nodes_ref[k].parent as usize));
-                prefetch(slots_ptr.get().wrapping_add(keys_ref[k] as usize & tmask));
-            }
-            for k in i..end {
-                let mut r = k;
+    let next_id = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..helpers.max(1) {
+            sc.spawn(|| {
+                // Each ID needs two reads that miss the cache, one after the other: its root's node,
+                // then its table slot. Three steps run AHEAD apart so both are requested early:
+                // request the node; find the root and request the slot; insert.
+                const STEP: usize = 8192;
+                const AHEAD: usize = 16;
+                let mut ring = [(0u64, 0u64); AHEAD]; // (person key, person name) of IDs between steps 2 and 3
                 loop {
-                    let p = nodes_ref[r].parent as usize;
-                    if p == r { break; }
-                    r = p;
-                }
-                let root = &nodes_ref[r];
-                let (h, pk, name) = (keys_ref[k], name_hash(root.key, root.name), root.name);
-                // claim the first free slot by its name word; nobody reads the other words until
-                // every thread is done
-                let mut s = h as usize & tmask;
-                loop {
-                    let slot = unsafe { slots_ptr.get().add(s) };
-                    let name_word = unsafe { std::sync::atomic::AtomicU64::from_ptr(std::ptr::addr_of_mut!((*slot)[2])) };
-                    if name_word.compare_exchange(0, name, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok() {
-                        unsafe {
-                            std::ptr::addr_of_mut!((*slot)[0]).write(h);
-                            std::ptr::addr_of_mut!((*slot)[1]).write(pk);
+                    let lo = next_id.fetch_add(STEP, Ordering::Relaxed);
+                    if lo >= n { break; }
+                    let hi = (lo + STEP).min(n);
+                    for t in lo..hi + 2 * AHEAD {
+                        if t >= lo + 2 * AHEAD {
+                            let k = t - 2 * AHEAD;
+                            let (h, (pk, name)) = (keys_ref[k], ring[k % AHEAD]);
+                            // An ID whose person is itself needs no entry: a lookup that finds
+                            // nothing answers with the ID's own hash and name.
+                            if pk != h {
+                                // claim the first free slot by its name word; nobody reads the
+                                // other words until every thread is done
+                                let mut s = h as usize & tmask;
+                                loop {
+                                    let slot = unsafe { slots_ptr.get().add(s) };
+                                    let name_word = unsafe { AtomicU64::from_ptr(std::ptr::addr_of_mut!((*slot)[2])) };
+                                    if name_word.compare_exchange(0, name, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                                        unsafe {
+                                            std::ptr::addr_of_mut!((*slot)[0]).write(h);
+                                            std::ptr::addr_of_mut!((*slot)[1]).write(pk);
+                                        }
+                                        break;
+                                    }
+                                    s = (s + 1) & tmask;
+                                }
+                            }
                         }
-                        break;
+                        if t >= lo + AHEAD && t - AHEAD < hi {
+                            let k = t - AHEAD;
+                            let mut r = k;
+                            loop {
+                                let p = nodes_ref[r].parent as usize;
+                                if p == r { break; }
+                                r = p;
+                            }
+                            let root = &nodes_ref[r];
+                            let pk = name_hash(root.key, root.name);
+                            ring[k % AHEAD] = (pk, root.name);
+                            if pk != keys_ref[k] { prefetch(slots_ptr.get().wrapping_add(keys_ref[k] as usize & tmask)); }
+                        }
+                        if t < hi { prefetch(nodes_ref.as_ptr().wrapping_add(nodes_ref[t].parent as usize)); }
                     }
-                    s = (s + 1) & tmask;
                 }
-            }
-            i = end;
+            });
         }
     });
     eprintln!("          links: {} pairs parsed at {:.3}s, {} ids joined at {:.3}s, table filled at {:.3}s", npairs, t_pairs, n, t_joined, t0.elapsed().as_secs_f64());
@@ -1210,7 +1242,8 @@ fn main() {
 
     // ---- links on a side thread: nothing needs them until the events are deduplicated
     let link_dir = data.join("links");
-    let links_thread = std::thread::spawn(move || build_links(link_dir));
+    let link_helpers = (threads / 2).max(1);
+    let links_thread = std::thread::spawn(move || build_links(link_dir, link_helpers));
 
     // ---- products and campaigns
     let mut cats: Vec<&[u8]> = vec![b"unknown"];
