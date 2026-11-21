@@ -1449,9 +1449,34 @@ fn main() {
         let mut starts: Vec<i64> = Vec::new();       // this person's session starts
         let mut runs: Vec<(usize, usize)> = Vec::new(); // (day index, first session index) per day
         let mut ct: Vec<(u32, i64)> = Vec::new();
+        // Time order through 64-bit keys, so the 32-byte records never move: time since the
+        // window start (40 bits), the record's index within the person (23 bits), and whether it
+        // is a purchase (1 bit). A person with 2^23 events or more is sorted the plain way.
+        const KEY_INDEX_BITS: u32 = 23;
+        let mut keys: Vec<u64> = Vec::new();
         for person in 0..people {
             let (i, j) = (e_off[person] as usize, e_off[person + 1] as usize);
-            ev[i..j].sort_unstable_by_key(|e| e.ts);
+            // the name's bytes are in a mapped file, far from anything in cache: ask for them early
+            if person + 3 < people { prefetch((ev[e_off[person + 3] as usize].name & 0xFFFF_FFFF_FFFF) as *const u8); }
+            let keyed = j - i < (1 << KEY_INDEX_BITS);
+            if keyed {
+                keys.clear();
+                keys.extend(ev[i..j].iter().enumerate().map(|(x, e)| (((e.ts - ws) as u64) << (KEY_INDEX_BITS + 1)) | ((x as u64) << 1) | (e.price > 0) as u64));
+                keys.sort_unstable();
+            } else {
+                ev[i..j].sort_unstable_by_key(|e| e.ts);
+            }
+            // the k-th event of this person in time order: its time, and its record if it is a purchase
+            let at = |k: usize| -> (i64, Option<&Sv>) {
+                if keyed {
+                    let key = unsafe { *keys.get_unchecked(k - i) };
+                    let rec = if key & 1 != 0 { Some(unsafe { ev.get_unchecked(i + ((key >> 1) & ((1 << KEY_INDEX_BITS) - 1)) as usize) }) } else { None };
+                    (ws + (key >> (KEY_INDEX_BITS + 1)) as i64, rec)
+                } else {
+                    let e = &ev[k];
+                    (e.ts, if e.price > 0 { Some(e) } else { None })
+                }
+            };
             // this person's clicks: latest ts last; among equal ts the smallest click_id last; copies dropped
             let pc_all = &mut cks_sorted[c_off[person] as usize..c_off[person + 1] as usize];
             pc_all.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| if x.id == y.id { std::cmp::Ordering::Equal } else { unpack(y.id).cmp(unpack(x.id)) }));
@@ -1491,7 +1516,7 @@ fn main() {
                 p.rows += 1;
             };
             while k < j {
-                let start = ev[k].ts;
+                let start = at(k).0;
                 let day = (start.div_euclid(DAY_MS) - day0) as usize;
                 if day != cur_day {
                     if cur_day != usize::MAX { flush(&mut p, cur_day, d_sessions, d_events, d_rev, &mut cat_sum, &mut touched); }
@@ -1499,14 +1524,15 @@ fn main() {
                     runs.push((day, starts.len()));
                 }
                 let (mut n, mut rev, mut prev) = (0i64, 0i64, start);
-                while k < j && ev[k].ts - prev <= GAP_MS {
-                    let e = &ev[k];
-                    if e.price > 0 {
+                while k < j {
+                    let (ts, purchase) = at(k);
+                    if ts - prev > GAP_MS { break; }
+                    if let Some(e) = purchase {
                         rev += e.price as i64;
                         if cat_sum[e.cat as usize] == 0 { touched.push(e.cat); }
                         cat_sum[e.cat as usize] += e.price as i64;
                     }
-                    n += 1; prev = e.ts; k += 1;
+                    n += 1; prev = ts; k += 1;
                 }
                 d_sessions += 1; d_events += n; d_rev += rev;
                 starts.push(start);
