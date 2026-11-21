@@ -1035,7 +1035,7 @@ fn pbucket(pk: u64, np_mask: u64) -> usize { ((pk >> 40) & np_mask) as usize }
 struct EvCtx<'a> { nb: usize, nb_shift: u32, ws: i64, we: i64, products: &'a IdMap<u32> }
 /// Parses one chunk of an events file into a block sorted by dedup bucket.
 #[inline(always)]
-fn parse_events<const WIDE: bool>(part: &[u8], c: &EvCtx) -> ChunkOut {
+fn parse_events<const WIDE: bool>(part: &[u8], c: &EvCtx, salt: u64) -> ChunkOut {
     // Stage the chunk's events in arrival order, counting per bucket, then place them in a block
     // of exactly the right size. Nothing is reserved that is not used.
     let (nb, nb_shift, ws, we) = (c.nb, c.nb_shift, c.ws, c.we);
@@ -1047,7 +1047,7 @@ fn parse_events<const WIDE: bool>(part: &[u8], c: &EvCtx) -> ChunkOut {
     let mut dc = DateCache::new();
     scan_lines::<7, WIDE>(part, |[id, user, ts, ingest, ty, product, price]| {
         if id.is_empty() { return; }
-        let h = xxh3_128(id);
+        let h = xxh3_128(id) ^ (salt as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835); // diagnostic: copies get distinct IDs
         let hi = (h >> 64) as u64;
         let ingest_ms = parse_ts(ingest, &mut dc);
         let mut e = Ev { eid: h as u64, user: 0, name: 0, tp: DEAD_TP, ingest: i32::MIN, cat: 0, eid2: hi as u16 };
@@ -1070,7 +1070,7 @@ fn parse_events<const WIDE: bool>(part: &[u8], c: &EvCtx) -> ChunkOut {
                 }
                 _ => return,
             }
-            e.user = xxh3_64(user);
+            e.user = xxh3_64(user) ^ salt.wrapping_mul(0xD6E8_FEB8_6659_FD93);
             e.name = pack(user);
             e.tp = (((t - ws) as u64) << PRICE_BITS) | cents as u64;
         })();
@@ -1097,7 +1097,7 @@ fn parse_events<const WIDE: bool>(part: &[u8], c: &EvCtx) -> ChunkOut {
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
-unsafe fn parse_events_fast(part: &[u8], c: &EvCtx) -> ChunkOut { parse_events::<true>(part, c) }
+unsafe fn parse_events_fast(part: &[u8], c: &EvCtx, salt: u64) -> ChunkOut { parse_events::<true>(part, c, salt) }
 
 struct CkCtx<'a> { ws: i64, we: i64, campaigns: &'a IdMap<u32>, camp_names: &'a [&'a [u8]], links: &'a LinkTab, np: usize, np_mask: u64 }
 /// The valid clicks of one parsed chunk in one exactly sized block, ordered by person partition:
@@ -1110,7 +1110,7 @@ thread_local! {
 /// Parses one chunk of a clicks file: its valid clicks, each with its person, ordered by person
 /// partition.
 #[inline(always)]
-fn parse_clicks<const WIDE: bool>(part: &[u8], c: &CkCtx) -> ClickChunk {
+fn parse_clicks<const WIDE: bool>(part: &[u8], c: &CkCtx, salt: u64) -> ClickChunk {
     let (ws, we) = (c.ws, c.we);
     // one chunk at a time per thread, and nothing below re-enters this function
     let v = unsafe { &mut *CLICK_STAGE.with(|s| s.as_ptr()) };
@@ -1122,7 +1122,7 @@ fn parse_clicks<const WIDE: bool>(part: &[u8], c: &CkCtx) -> ClickChunk {
         if t < ws - WEEK_MS || t >= we { return; }
         let Some(&k) = c.campaigns.get(&xxh3_64(camp)) else { return };
         if c.camp_names[k as usize] != camp { return; }
-        v.push(Ck { pk: xxh3_64(user), tc: (((t - (ws - WEEK_MS)) as u64) << CAMP_BITS) | k as u64, id: pack(id) });
+        v.push(Ck { pk: xxh3_64(user) ^ salt.wrapping_mul(0xD6E8_FEB8_6659_FD93), tc: (((t - (ws - WEEK_MS)) as u64) << CAMP_BITS) | k as u64, id: pack(id) });
     });
     let mut part_off = vec![0u32; c.np + 1];
     for blk in v.chunks_mut(32) {
@@ -1149,7 +1149,7 @@ fn parse_clicks<const WIDE: bool>(part: &[u8], c: &CkCtx) -> ClickChunk {
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
-unsafe fn parse_clicks_fast(part: &[u8], c: &CkCtx) -> ClickChunk { parse_clicks::<true>(part, c) }
+unsafe fn parse_clicks_fast(part: &[u8], c: &CkCtx, salt: u64) -> ClickChunk { parse_clicks::<true>(part, c, salt) }
 
 /// One person partition's user_daily rows, already PLAIN-encoded per column.
 #[derive(Default)]
@@ -1250,177 +1250,64 @@ fn self_faults() -> (i64, i64) {
         (u.ru_minflt as i64, u.ru_majflt as i64)
     }
 }
-/// Runs this binary as a child with extra environment; prints one line of timings.
+/// Runs this binary as a child with extra environment; prints one short line: whole-process
+/// wall, user and system milliseconds, minor faults in thousands, then the milliseconds spent in
+/// each stage (events parsed, wait for links, dedup, clicks, sessions, write, release).
 fn diag_child(label: &str, env: &[(&str, &str)], unset: &[&str]) {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let exe = std::env::current_exe().unwrap();
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.env("SS_CHILD", "1").stderr(Stdio::piped()).stdout(Stdio::null());
     for (k, v) in env { cmd.env(k, v); }
     for k in unset { cmd.env_remove(k); }
     let before = children_usage();
     let t = Instant::now();
-    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("D {label}: spawn failed {e}"); return; } };
+    let Ok(mut child) = cmd.spawn() else { eprintln!("D {label} spawn failed"); return; };
     let mut log = String::new();
     let _ = child.stderr.take().unwrap().read_to_string(&mut log);
-    let status = child.wait();
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
     let wall = t.elapsed().as_secs_f64();
     let after = children_usage();
-    // cumulative stage times from the child's own log: "[  0.123s user ..."
-    let stages: Vec<String> = log.lines().filter_map(|l| l.trim_start().strip_prefix('[')).filter_map(|l| l.split('s').next()).map(|x| x.trim().to_string()).collect();
-    eprintln!("D {label}: wall {:.3} user {:.3} sys {:.3} minflt {} majflt {} maxrss_mb {} ok {} stages {}",
-        wall, after.0 - before.0, after.1 - before.1, after.2 - before.2, after.3 - before.3, after.4 / 1024,
-        status.map(|s| s.success()).unwrap_or(false), stages.join(" "));
+    let cum: Vec<f64> = log.lines().filter_map(|l| l.trim_start().strip_prefix('[')).filter_map(|l| l.split('s').next()).filter_map(|x| x.trim().parse().ok()).collect();
+    let stages: Vec<String> = cum.iter().enumerate().map(|(i, &c)| format!("{:.0}", (c - if i > 0 { cum[i - 1] } else { 0.0 }) * 1e3)).collect();
+    eprintln!("D {label} w{:.0} u{:.0} s{:.0} f{}k {}{}", wall * 1e3, (after.0 - before.0) * 1e3, (after.1 - before.1) * 1e3, (after.2 - before.2) / 1000, stages.join(" "), if ok { "" } else { " FAILED" });
 }
-#[allow(unused_mut, unused_variables)]
 fn diag_parent() -> ! {
     let t0 = Instant::now();
-    eprintln!("D ==== diagnostic build: prints measurements and fails on purpose ====");
-    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
-    // residency of the event files in the page cache, before anything reads them
-    let ev = list_csv(&data.join("events"));
-    let (mut pages, mut resident, mut bytes) = (0usize, 0usize, 0usize);
-    let mut biggest: Option<(usize, PathBuf)> = None;
-    for p in &ev {
-        let Ok(f) = File::open(p) else { continue };
-        let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
-        bytes += len;
-        if len == 0 { continue; }
-        if biggest.as_ref().map_or(true, |b| len > b.0) { biggest = Some((len, p.clone())); }
-        #[cfg(target_os = "linux")]
-        unsafe {
-            let m = Mmap::map(&f).unwrap();
-            let n = (len + 4095) / 4096;
-            let mut v = vec![0u8; n];
-            if libc::mincore(m.as_ptr() as *mut libc::c_void, len, v.as_mut_ptr()) == 0 {
-                pages += n;
-                resident += v.iter().filter(|&&b| b & 1 != 0).count();
-            }
-        }
-    }
-    eprintln!("D data: {} event files, {} MB; in page cache at start: {} of {} pages", ev.len(), bytes >> 20, resident, pages);
-    // read every event file twice with plain reads: the first is cold if the cache was
-    let read_all = || {
-        use std::io::Read;
-        let t = Instant::now();
-        let mut buf = vec![0u8; 1 << 20];
-        let mut total = 0usize;
-        for p in &ev {
-            let Ok(mut f) = File::open(p) else { continue };
-            loop { match f.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => total += n } }
-        }
-        (t.elapsed().as_secs_f64(), total)
-    };
-    let (r1, n1) = read_all();
-    let (r2, _) = read_all();
-    eprintln!("D reading all event files: first pass {:.1} ms ({:.0} MB/s), second pass {:.1} ms ({:.0} MB/s)", r1 * 1e3, n1 as f64 / 1e6 / r1.max(1e-9), r2 * 1e3, n1 as f64 / 1e6 / r2.max(1e-9));
-    eprintln!("D thp: enabled={} defrag={} shmem={} pmd={}", slurp("/sys/kernel/mm/transparent_hugepage/enabled"), slurp("/sys/kernel/mm/transparent_hugepage/defrag"),
-        slurp("/sys/kernel/mm/transparent_hugepage/shmem_enabled"), slurp("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size"));
-    eprintln!("D kernel: {}", clip(slurp("/proc/version"), 110));
+    let thp = slurp("/sys/kernel/mm/transparent_hugepage/enabled");
+    let thp = thp.split('[').nth(1).and_then(|x| x.split(']').next()).unwrap_or("?").to_string();
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let model = cpuinfo.lines().find(|l| l.starts_with("model name")).unwrap_or("?").to_string();
+    let model = cpuinfo.lines().find(|l| l.starts_with("model name")).and_then(|l| l.split(':').nth(1)).unwrap_or("?").trim().to_string();
     let flags = cpuinfo.lines().find(|l| l.starts_with("flags")).unwrap_or("");
-    let have: Vec<&str> = ["avx2", "bmi2", "popcnt", "avx512f", "avx512bw", "avx512vbmi2", "pdpe1gb", "hypervisor"].into_iter().filter(|f| flags.split(' ').any(|x| x == *f)).collect();
-    eprintln!("D cpu: {} | logical {} | usable {} | flags {}", model, cpuinfo.matches("processor\t").count(),
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0), have.join(","));
-    eprintln!("D cgroup: cpu.max={} cpuset={} mem.max={} mem.high={} | env NCPU={:?} MEM_GB={:?} TUN={:?}", slurp("/sys/fs/cgroup/cpu.max"), slurp("/sys/fs/cgroup/cpuset.cpus.effective"),
-        slurp("/sys/fs/cgroup/memory.max"), slurp("/sys/fs/cgroup/memory.high"), std::env::var("NCPU").ok(), std::env::var("MEM_GB").ok(), std::env::var("GLIBC_TUNABLES").ok());
-    let mi = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let pick: Vec<&str> = mi.lines().filter(|l| ["MemTotal", "MemFree", "MemAvailable", "Cached:", "AnonHugePages", "HugePages_Total", "Hugepagesize", "SwapTotal"].iter().any(|k| l.starts_with(k))).collect();
-    eprintln!("D meminfo: {}", pick.join(" | ").replace("  ", ""));
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    for l in mounts.lines() {
-        let f: Vec<&str> = l.split(' ').collect();
-        if f.len() > 8 && ["/", "/data", "/output", "/scratch", "/tmp"].contains(&f[4]) {
-            let sep = f.iter().position(|x| *x == "-").unwrap_or(f.len() - 3);
-            eprintln!("D mount {} : {} {} {}", f[4], f.get(sep + 1).unwrap_or(&"?"), clip(f.get(sep + 2).unwrap_or(&"?").to_string(), 40), clip(f[5].to_string(), 40));
-        }
-    }
-    // how long before this process started was the container set up?
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() - t0.elapsed().as_secs_f64();
-        let age = |p: &str| std::fs::metadata(p).map(|m| format!("{:.3}", now - (m.ctime() as f64 + m.ctime_nsec() as f64 / 1e9))).unwrap_or_else(|_| "?".into());
-        eprintln!("D seconds from creation to process start: /etc/hostname {} /etc/resolv.conf {} /sys/fs/cgroup {} /proc/1 {} /output {}",
-            age("/etc/hostname"), age("/etc/resolv.conf"), age("/sys/fs/cgroup"), age("/proc/1"), age("/output"));
-    }
-
-    // whole-process timings; "stages" are the child's cumulative seconds at: events parsed, links
-    // ready, events deduped, clicks parsed, sessions done, written, released
-    let in_time = |t0: &Instant| t0.elapsed().as_secs_f64() < 75.0;
-    for i in 0..3 { diag_child(&format!("start-and-exit-only {i}"), &[("SS_CHILD", "exit")], &[]); }
-    for i in 0..4 { diag_child(&format!("dev {i}"), &[], &[]); }
-    for i in 0..2 { diag_child(&format!("dev heap-hugepage-tunable-off {i}"), &[], &["GLIBC_TUNABLES"]); }
-    for i in 0..2 { diag_child(&format!("dev 4 threads {i}"), &[("NCPU", "4")], &[]); }
-    for i in 0..2 { diag_child(&format!("dev 1 thread {i}"), &[("NCPU", "1")], &[]); }
-    for i in 0..3 { if in_time(&t0) { diag_child(&format!("dev x20 input {i}"), &[("SS_REPEAT", "20")], &[]); } }
-    for i in 0..2 { if in_time(&t0) { diag_child(&format!("dev x20 input heap-hugepage-tunable-off {i}"), &[("SS_REPEAT", "20")], &["GLIBC_TUNABLES"]); } }
-    for i in 0..2 { if in_time(&t0) { diag_child(&format!("dev x20 input 4 threads {i}"), &[("SS_REPEAT", "20"), ("NCPU", "4")], &[]); } }
-
-    // raw memory costs, single thread unless said otherwise
-    #[cfg(target_os = "linux")]
-    unsafe {
-        const SZ: usize = 256 << 20;
-        let touch = |p: *mut u8, len: usize| { let mut i = 0; while i < len { p.add(i).write_volatile(1); i += 4096; } };
-        for huge in [false, true] {
-            let p = libc::mmap(std::ptr::null_mut(), SZ, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) as *mut u8;
-            if huge { libc::madvise(p as *mut libc::c_void, SZ, libc::MADV_HUGEPAGE); }
-            let f0 = self_faults();
-            let t = Instant::now();
-            touch(p, SZ);
-            let a = t.elapsed().as_secs_f64();
-            let f1 = self_faults();
-            let t = Instant::now();
-            touch(p, SZ);
-            let again = t.elapsed().as_secs_f64();
-            let roll = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
-            let hp = roll.lines().find(|l| l.starts_with("AnonHugePages")).map(|l| l.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")).unwrap_or_else(|| "?".into());
-            let t = Instant::now();
-            libc::munmap(p as *mut libc::c_void, SZ);
-            let b = t.elapsed().as_secs_f64();
-            eprintln!("D anon 256MB {}: first touch {:.1} ms ({} faults), second touch {:.1} ms, unmap {:.1} ms, huge pages while mapped: {}", if huge { "with MADV_HUGEPAGE" } else { "plain" }, a * 1e3, f1.0 - f0.0, again * 1e3, b * 1e3, hp);
-        }
-        // eight threads touching 64 MB each, then eight threads giving it back
-        let p = libc::mmap(std::ptr::null_mut(), 8 * (64 << 20), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) as usize;
-        let t = Instant::now();
-        std::thread::scope(|s| { for k in 0..8usize { s.spawn(move || touch((p + k * (64 << 20)) as *mut u8, 64 << 20)); } });
-        let a = t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        std::thread::scope(|s| { for k in 0..8usize { s.spawn(move || { libc::madvise((p + k * (64 << 20)) as *mut libc::c_void, 64 << 20, libc::MADV_DONTNEED); }); } });
-        let b = t.elapsed().as_secs_f64();
-        eprintln!("D anon 512MB on 8 threads: first touch {:.1} ms, release {:.1} ms", a * 1e3, b * 1e3);
-        if let Some((len, path)) = biggest {
-            let f = File::open(&path).unwrap();
-            let mut buf = vec![1u8; len];
-            let rd = |buf: &mut Vec<u8>| { let mut off = 0usize; while off < len { let n = libc::pread(std::os::unix::io::AsRawFd::as_raw_fd(&f), buf.as_mut_ptr().add(off) as *mut libc::c_void, (len - off).min(1 << 20), off as i64); if n <= 0 { break; } off += n as usize; } };
-            rd(&mut buf);
-            let t = Instant::now();
-            rd(&mut buf);
-            let r = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let m = Mmap::map(&f).unwrap();
-            let f0 = self_faults();
-            let mut i = 0;
-            while i < len { std::hint::black_box(m.as_ptr().add(i).read_volatile()); i += 4096; }
-            let f1 = self_faults();
-            let a = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            drop(m);
-            let b = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            std::hint::black_box(memchr::memchr_iter(b'\n', &buf).count());
-            let c = t.elapsed().as_secs_f64();
-            eprintln!("D biggest event file {} MB: read into warm buffer {:.1} ms, map and touch every page {:.1} ms ({} faults), unmap {:.1} ms, scan for newlines {:.1} ms",
-                len >> 20, r * 1e3, a * 1e3, f1.0 - f0.0, b * 1e3, c * 1e3);
-        }
+    let have: Vec<&str> = ["avx2", "bmi2", "popcnt", "avx512f", "avx512bw", "avx512vbmi2"].into_iter().filter(|f| flags.split(' ').any(|x| x == *f)).collect();
+    eprintln!("D benchmark, not an entry. thp={} cpu={} n={} {}", thp, clip(model, 44), std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0), have.join(","));
+    eprintln!("D ms: wall user sys faults | parse links dedup clicks sessions write release");
+    let big: [(&str, &str); 2] = [("SS_REPEAT", "20"), ("SS_SALT", "1")];
+    let runs: [(&str, &[(&str, &str)], &[&str]); 12] = [
+        ("dev", &[], &[]),
+        ("a", &[], &[]),
+        ("b", &[], &[]),
+        ("base", &[("SS_BASELINE", "1")], &[]),
+        ("t4", &[("NCPU", "4")], &[]),
+        ("nothp", &[], &["GLIBC_TUNABLES"]),
+        ("nb512", &[("SS_NB", "512")], &[]),
+        ("nb4096", &[("SS_NB", "4096")], &[]),
+        ("np256", &[("SS_NP", "256")], &[]),
+        ("np4096", &[("SS_NP", "4096")], &[]),
+        ("nosalt", &[], &[]),
+        ("c", &[], &[]),
+    ];
+    for (label, extra, unset) in runs {
+        if t0.elapsed().as_secs_f64() > 110.0 { break; }
+        let mut env: Vec<(&str, &str)> = match label { "dev" => vec![], "nosalt" => vec![("SS_REPEAT", "20")], _ => big.to_vec() };
+        env.extend_from_slice(extra);
+        diag_child(label, &env, unset);
     }
     // leave no output behind: this run must not pass as an entry
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let _ = std::fs::remove_dir_all(out.join("user_daily"));
     let _ = std::fs::remove_dir_all(out.join("campaign_daily"));
-    eprintln!("D ==== end of diagnostics after {:.1} s; output removed; exiting with status 1 on purpose ====", t0.elapsed().as_secs_f64());
+    eprintln!("D end {:.0}s, exit 1 on purpose", t0.elapsed().as_secs_f64());
     std::process::exit(1);
 }
 
@@ -1515,13 +1402,16 @@ fn main() {
     assert!(ncamp < 1 << CAMP_BITS, "too many campaigns for the packed click");
     let np_mask = (np - 1) as u64;
     let chunk = (ev_bytes / (threads * 8)).clamp(1 << 20, 16 << 20);
-    let ev_parts: Vec<&'static [u8]> = ev_files.iter().flat_map(|d| chunks(d, chunk)).collect();
+    // diagnostic: with SS_SALT each repeated copy of the files gets its own event and user IDs
+    let salted = std::env::var_os("SS_SALT").is_some();
+    let ev_base_n = (ev_files.len() / repeat).max(1);
+    let ev_parts: Vec<(&'static [u8], u64)> = ev_files.iter().enumerate().flat_map(|(i, d)| chunks(d, chunk).into_iter().map(move |c| (c, if salted { (i / ev_base_n) as u64 } else { 0 }))).collect();
     let fast = fast_cpu();
     let ev_ctx = EvCtx { nb, nb_shift, ws, we, products: &products };
-    let parsed: Vec<ChunkOut> = ev_parts.par_iter().map(|part| {
+    let parsed: Vec<ChunkOut> = ev_parts.par_iter().map(|&(part, salt)| {
         #[cfg(target_arch = "x86_64")]
-        if fast { return unsafe { parse_events_fast(part, &ev_ctx) }; }
-        parse_events::<false>(part, &ev_ctx)
+        if fast { return unsafe { parse_events_fast(part, &ev_ctx, salt) }; }
+        parse_events::<false>(part, &ev_ctx, salt)
     }).collect();
     rayon::broadcast(|_| { let (a, b) = unsafe { &mut *STAGE.with(|s| s.as_ptr()) }; release_pages(a); release_pages(b); });
     lap(&format!("events parsed ({} dedup buckets, {} person partitions, {} parser)", nb, np, if fast { "AVX2" } else { "baseline" }));
@@ -1659,12 +1549,13 @@ fn main() {
     let ck_files: Vec<&'static [u8]> = { let f = map_dir(&data.join("clicks")); (0..repeat).flat_map(|_| f.clone()).collect() };
     let ck_bytes: usize = ck_files.iter().map(|d| d.len()).sum();
     let ck_chunk = (ck_bytes / (threads * 8)).clamp(1 << 20, 8 << 20);
-    let ck_parts: Vec<&'static [u8]> = ck_files.iter().flat_map(|d| chunks(d, ck_chunk)).collect();
+    let ck_base_n = (ck_files.len() / repeat).max(1);
+    let ck_parts: Vec<(&'static [u8], u64)> = ck_files.iter().enumerate().flat_map(|(i, d)| chunks(d, ck_chunk).into_iter().map(move |c| (c, if salted { (i / ck_base_n) as u64 } else { 0 }))).collect();
     let ck_ctx = CkCtx { ws, we, campaigns: &campaigns, camp_names: &camp_names, links: &links, np, np_mask };
-    let click_chunks: Vec<ClickChunk> = ck_parts.par_iter().map(|part| {
+    let click_chunks: Vec<ClickChunk> = ck_parts.par_iter().map(|&(part, salt)| {
         #[cfg(target_arch = "x86_64")]
-        if fast { return unsafe { parse_clicks_fast(part, &ck_ctx) }; }
-        parse_clicks::<false>(part, &ck_ctx)
+        if fast { return unsafe { parse_clicks_fast(part, &ck_ctx, salt) }; }
+        parse_clicks::<false>(part, &ck_ctx, salt)
     }).collect();
     rayon::broadcast(|_| { let b = unsafe { &mut *CLICK_STAGE.with(|s| s.as_ptr()) }; release_pages(b); });
     // the session stage reads the click blocks in place: one piece per chunk for each partition
