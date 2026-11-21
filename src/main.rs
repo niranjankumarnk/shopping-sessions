@@ -10,7 +10,7 @@
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::Write;
+use std::io::{IoSlice, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -483,6 +483,33 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v.sort();
     v
 }
+/// Large regions that stay in use until the output is written and are never handed back to the
+/// allocator: the mapped inputs and the biggest arrays. `release_regions` returns them to the
+/// kernel on all threads just before exit, so the single-threaded teardown has little left to do.
+static REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+fn note_region(start: usize, len: usize) { REGIONS.lock().unwrap().push((start, len)); }
+fn note_vec<T>(v: &Vec<T>) { note_region(v.as_ptr() as usize, v.capacity() * std::mem::size_of::<T>()); }
+fn release_regions() {
+    #[cfg(target_os = "linux")]
+    {
+        const PAGE: usize = 4096;
+        const HUGE: usize = 2 << 20;
+        let regions = std::mem::take(&mut *REGIONS.lock().unwrap());
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for (start, len) in regions {
+            let (a, b) = ((start + PAGE - 1) & !(PAGE - 1), (start + len) & !(PAGE - 1));
+            let mut p = a;
+            while p < b {
+                // cut on 2 MB boundaries so no huge page is split between two pieces
+                let q = (((p + (32 << 20)) & !(HUGE - 1)).max(p + PAGE)).min(b);
+                pieces.push((p, q - p));
+                p = q;
+            }
+        }
+        pieces.par_iter().for_each(|&(p, l)| unsafe { libc::madvise(p as *mut libc::c_void, l, libc::MADV_DONTNEED); });
+    }
+}
+
 fn map_file(p: &Path) -> Option<&'static [u8]> {
     let f = File::open(p).ok()?;
     if f.metadata().ok()?.len() == 0 { return None; }
@@ -490,6 +517,7 @@ fn map_file(p: &Path) -> Option<&'static [u8]> {
     #[cfg(unix)]
     let _ = m.advise(memmap2::Advice::Sequential);
     let s: &'static [u8] = unsafe { std::slice::from_raw_parts(m.as_ptr(), m.len()) };
+    note_region(m.as_ptr() as usize, (m.len() + 4095) & !4095);
     std::mem::forget(m); // mapped for the life of the process
     Some(s)
 }
@@ -567,6 +595,7 @@ fn build_links(dir: PathBuf) -> LinkTab {
     let mask = cap - 1;
     let mut slots = vec![[0u64; 4]; cap];
     advise_huge(&slots);
+    note_vec(&slots);
     for i in 0..names.len() as u32 {
         let r = find(&mut parent, i) as usize;
         let h = keys[i as usize];
@@ -612,14 +641,31 @@ struct Col { name: &'static str, ty: i32, utf8: bool, date: bool, optional: bool
 /// One data page: `nvals` values whose body is the concatenation of `body`.
 struct Page<'a> { nvals: usize, body: [&'a [u8]; 2] }
 
+/// Writes all the slices with as few system calls as possible.
+fn write_all_slices(f: &mut File, bufs: &[&[u8]]) {
+    for batch in bufs.chunks(1000) {
+        let io: Vec<IoSlice> = batch.iter().map(|b| IoSlice::new(b)).collect();
+        let want: usize = batch.iter().map(|b| b.len()).sum();
+        let mut done = f.write_vectored(&io).unwrap();
+        if done < want {
+            // a short write: finish the batch slice by slice
+            for b in batch {
+                if done >= b.len() { done -= b.len(); continue; }
+                f.write_all(&b[done..]).unwrap();
+                done = 0;
+            }
+        }
+    }
+}
+
 /// Writes one Parquet file with at most one row group; `pages[c]` are column c's pages in row order.
+/// The page bodies are written from where they are; only headers and the footer are built here.
 fn write_parquet(path: &Path, cols: &[Col], nrows: usize, pages: &[Vec<Page>]) {
-    let total: usize = pages.iter().flatten().map(|p| p.body[0].len() + p.body[1].len() + 24).sum();
-    let mut f: Vec<u8> = Vec::with_capacity(total + 4096);
-    f.extend_from_slice(b"PAR1");
+    let mut headers: Vec<Vec<u8>> = Vec::new();
     let mut chunks_meta: Vec<(usize, usize)> = Vec::new(); // (first page offset, bytes)
+    let mut pos = 4usize;
     for col in pages {
-        let start = f.len();
+        let start = pos;
         for p in col {
             let size = p.body[0].len() + p.body[1].len();
             let mut h = Thrift::new();
@@ -633,11 +679,10 @@ fn write_parquet(path: &Path, cols: &[Col], nrows: usize, pages: &[Vec<Page>]) {
             h.i32(4, 3); // repetition levels: RLE
             h.end();
             h.b.push(0);
-            f.extend_from_slice(&h.b);
-            f.extend_from_slice(p.body[0]);
-            f.extend_from_slice(p.body[1]);
+            pos += h.b.len() + size;
+            headers.push(h.b);
         }
-        chunks_meta.push((start, f.len() - start));
+        chunks_meta.push((start, pos - start));
     }
     let mut t = Thrift::new();
     t.i32(1, 1); // version
@@ -688,16 +733,45 @@ fn write_parquet(path: &Path, cols: &[Col], nrows: usize, pages: &[Vec<Page>]) {
     }
     t.binary(6, b"shopping-sessions");
     t.b.push(0);
-    f.extend_from_slice(&t.b);
-    f.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
-    f.extend_from_slice(b"PAR1");
-    File::create(path).unwrap().write_all(&f).unwrap();
+    let footer_len = (t.b.len() as u32).to_le_bytes();
+    let mut bufs: Vec<&[u8]> = Vec::with_capacity(headers.len() * 3 + 4);
+    bufs.push(b"PAR1");
+    let mut h = headers.iter();
+    for col in pages {
+        for p in col {
+            bufs.push(h.next().unwrap());
+            if !p.body[0].is_empty() { bufs.push(p.body[0]); }
+            if !p.body[1].is_empty() { bufs.push(p.body[1]); }
+        }
+    }
+    bufs.push(&t.b);
+    bufs.push(&footer_len);
+    bufs.push(b"PAR1");
+    write_all_slices(&mut File::create(path).unwrap(), &bufs);
 }
 
 #[inline(always)]
 fn put_str(v: &mut Vec<u8>, s: &[u8]) {
     v.extend_from_slice(&(s.len() as u32).to_le_bytes());
     v.extend_from_slice(s);
+}
+
+/// The events of one parsed chunk, grouped by dedup bucket inside a single block: bucket b owns
+/// slots `b * est .. b * est + lens[b]`. A bucket that fills its slots spills into `over[b]`.
+struct ChunkOut { base: *mut Ev, _block: Vec<Ev>, lens: Vec<u32>, over: Vec<Vec<Ev>>, est: usize }
+unsafe impl Send for ChunkOut {}
+unsafe impl Sync for ChunkOut {}
+impl ChunkOut {
+    /// Appends the pieces of bucket `b` as (pointer, length).
+    #[inline(always)]
+    fn pieces(&self, b: usize, out: &mut Vec<(*mut Ev, usize)>) {
+        let n = self.lens[b] as usize;
+        if n > 0 { out.push((unsafe { self.base.add(b * self.est) }, n)); }
+        if !self.over.is_empty() {
+            let v = &self.over[b];
+            if !v.is_empty() { out.push((v.as_ptr() as *mut Ev, v.len())); }
+        }
+    }
 }
 
 /// One person partition's user_daily rows, already PLAIN-encoded per column.
@@ -840,9 +914,15 @@ fn main() {
     let pbucket = move |pk: u64| -> usize { ((pk >> 40) & np_mask) as usize };
     let chunk = (ev_bytes / (threads * 8)).clamp(1 << 20, 16 << 20);
     let ev_parts: Vec<&'static [u8]> = ev_files.iter().flat_map(|d| chunks(d, chunk)).collect();
-    let mut parsed: Vec<Vec<Vec<Ev>>> = ev_parts.par_iter().map(|part| {
-        let est = part.len() / 64 / nb + 8;
-        let mut acc: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::with_capacity(est)).collect();
+    let parsed: Vec<ChunkOut> = ev_parts.par_iter().map(|part| {
+        // slots per bucket: the expected count plus four standard deviations
+        let mean = part.len() / 70 / nb;
+        let est = mean + 4 * ((mean as f64).sqrt() as usize) + 8;
+        let mut block: Vec<Ev> = Vec::with_capacity(nb * est);
+        advise_huge(&block);
+        let base = block.as_mut_ptr();
+        let mut lens = vec![0u32; nb];
+        let mut over: Vec<Vec<Ev>> = Vec::new();
         scan_lines::<7>(part, |[id, user, ts, ingest, ty, product, price]| {
             if id.is_empty() { return; }
             let h = xxh3_128(id);
@@ -871,9 +951,19 @@ fn main() {
                 e.name = pack(user);
                 e.ts = t;
             })();
-            unsafe { acc.get_unchecked_mut((hi >> nb_shift) as usize) }.push(e);
+            let b = (hi >> nb_shift) as usize;
+            let n = unsafe { *lens.get_unchecked(b) } as usize;
+            if n < est {
+                unsafe {
+                    base.add(b * est + n).write(e);
+                    *lens.get_unchecked_mut(b) = n as u32 + 1;
+                }
+            } else {
+                if over.is_empty() { over.resize_with(nb, Vec::new); }
+                over[b].push(e);
+            }
         });
-        acc
+        ChunkOut { base, _block: block, lens, over, est }
     }).collect();
     lap(&format!("events parsed ({} dedup buckets, {} person partitions)", nb, np));
 
@@ -884,24 +974,24 @@ fn main() {
     let groups = (threads * 8).min(nb);
     let per_group = nb / groups; // both are powers of two or nb is a multiple: nb >= 64 and threads*8 may not divide
     let groups = nb.div_ceil(per_group);
-    let parsed_ptr = Raw(parsed.as_mut_ptr());
-    let nchunks = parsed.len();
     let counts: Vec<Vec<u32>> = (0..groups).into_par_iter().map(|g| {
         let mut cnt = vec![0u32; np];
         let mut table: Vec<u64> = Vec::new();
         let mut refs: Vec<*mut Ev> = Vec::new();
+        let mut lists: Vec<(*mut Ev, usize)> = Vec::new();
         for b in (g * per_group)..((g + 1) * per_group).min(nb) {
             // this group is the only one touching bucket b of every chunk
-            let lists: Vec<&mut Vec<Ev>> = (0..nchunks).map(|c| unsafe { &mut *(*parsed_ptr.get().add(c)).as_mut_ptr().add(b) }).collect();
-            let n: usize = lists.iter().map(|l| l.len()).sum();
+            lists.clear();
+            for c in &parsed { c.pieces(b, &mut lists); }
+            let n: usize = lists.iter().map(|l| l.1).sum();
             if n == 0 { continue; }
             let cap = (n * 2).next_power_of_two();
             let mask = cap - 1;
             table.clear();
             table.resize(cap, 0);
             refs.clear();
-            for l in lists {
-                for e in l.iter_mut() {
+            for &(ptr, len) in &lists {
+                for e in unsafe { std::slice::from_raw_parts_mut(ptr, len) } {
                     let i = refs.len() as u64 + 1;
                     let tag = e.eid >> 32;
                     let mut s = e.eid as usize & mask;
@@ -953,13 +1043,16 @@ fn main() {
     let total_ev = ev_base[np];
     let mut evs: Vec<Sv> = Vec::with_capacity(total_ev);
     advise_huge(&evs);
+    note_vec(&evs);
     unsafe { evs.set_len(total_ev); }
     let evs_ptr = Raw(evs.as_mut_ptr());
     ev_offs.into_par_iter().enumerate().for_each(|(g, mut off)| {
+        let mut lists: Vec<(*mut Ev, usize)> = Vec::new();
         for b in (g * per_group)..((g + 1) * per_group).min(nb) {
-            for c in 0..nchunks {
-                let l: &Vec<Ev> = unsafe { &*(*parsed_ptr.get().add(c)).as_ptr().add(b) };
-                for e in l {
+            lists.clear();
+            for c in &parsed { c.pieces(b, &mut lists); }
+            for &(ptr, len) in &lists {
+                for e in unsafe { std::slice::from_raw_parts(ptr as *const Ev, len) } {
                     if e.ts == DEAD { continue; }
                     let p = pbucket(e.user);
                     unsafe { evs_ptr.get().add(off[p]).write(Sv { pk: e.user, ts: e.ts, name: e.name, price: e.price, cat: e.cat }); }
@@ -968,7 +1061,8 @@ fn main() {
             }
         }
     });
-    std::mem::forget(parsed); // freeing a million small buffers is slower than leaving them
+    // hand the blocks back to the allocator on all threads: the later stages reuse the memory
+    parsed.into_par_iter().for_each(drop);
     lap(&format!("events deduped: {} survive", total_ev));
 
     // ---- clicks: parse, validate, resolve people; copies are identical, so dedup happens after the sort
@@ -1001,6 +1095,7 @@ fn main() {
     let total_ck = ck_base[np];
     let mut cks: Vec<Ck> = Vec::with_capacity(total_ck);
     advise_huge(&cks);
+    note_vec(&cks);
     unsafe { cks.set_len(total_ck); }
     let cks_ptr = Raw(cks.as_mut_ptr());
     ck_parsed.par_iter().zip(ck_offs.into_par_iter()).for_each(|((v, _), mut off)| {
@@ -1255,6 +1350,11 @@ fn main() {
     let cpages: Vec<Vec<Page>> = bufs.iter().map(|b| if crows == 0 { vec![] } else { vec![Page { nvals: crows, body: [b, none] }] }).collect();
     write_parquet(&out.join("campaign_daily").join("part-000.parquet"), &ccols, crows, &cpages);
     lap("written");
-    // Skip destructors: the OS frees everything at exit.
+    release_regions();
+    lap("released");
+    // Skip destructors and exit handlers: the OS frees the rest.
+    #[cfg(unix)]
+    unsafe { libc::_exit(0) }
+    #[allow(unreachable_code)]
     std::process::exit(0);
 }
