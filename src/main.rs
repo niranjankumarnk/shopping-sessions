@@ -566,6 +566,7 @@ fn build_links(dir: PathBuf) -> LinkTab {
     let cap = (names.len() * 2).next_power_of_two().max(16);
     let mask = cap - 1;
     let mut slots = vec![[0u64; 4]; cap];
+    advise_huge(&slots);
     for i in 0..names.len() as u32 {
         let r = find(&mut parent, i) as usize;
         let h = keys[i as usize];
@@ -734,7 +735,32 @@ impl<T> PerThread<T> {
     fn mine(&self) -> &mut T { unsafe { &mut *self.0[rayon::current_thread_index().unwrap()].get() } }
 }
 
+/// glibc's defaults hand big blocks straight back to the kernel and grow heaps in small steps,
+/// which costs a system call and fresh page faults every time. Nothing here is long-lived enough
+/// to be worth returning, so keep memory in the heap and grow it in large steps.
+fn tune_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, i32::MAX);
+        libc::mallopt(libc::M_TOP_PAD, 512 << 20);
+    }
+}
+/// Asks for huge pages behind a large allocation (helps where the host only gives them on request).
+fn advise_huge<T>(v: &Vec<T>) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let (start, len) = (v.as_ptr() as usize, v.capacity() * std::mem::size_of::<T>());
+        let a = (start + 4095) & !4095;
+        let b = (start + len) & !4095;
+        if b > a + (4 << 20) { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_HUGEPAGE); }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = v;
+}
+
 fn main() {
+    tune_allocator();
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
@@ -806,9 +832,9 @@ fn main() {
     let ev_files = map_dir(&data.join("events"));
     let ev_bytes: usize = ev_files.iter().map(|d| d.len()).sum();
     let est_events = ev_bytes / 85 + 1;
-    let nb = (est_events / 20_000).next_power_of_two().clamp(64, 4096); // dedup buckets
+    let nb = (est_events / 16_000).next_power_of_two().clamp(64, 4096); // dedup buckets, sized to stay in cache
     let nb_shift = 64 - nb.trailing_zeros();
-    let np = (est_events / 40_000).next_power_of_two().clamp(16, 2048); // person partitions
+    let np = (est_events / 20_000).next_power_of_two().clamp(16, 4096); // person partitions
     let np_mask = (np - 1) as u64;
     let pbucket = move |pk: u64| -> usize { ((pk >> 40) & np_mask) as usize };
     let chunk = (ev_bytes / (threads * 8)).clamp(1 << 20, 16 << 20);
@@ -925,6 +951,7 @@ fn main() {
     let (ev_base, ev_offs) = scatter_offsets(&counts);
     let total_ev = ev_base[np];
     let mut evs: Vec<Sv> = Vec::with_capacity(total_ev);
+    advise_huge(&evs);
     unsafe { evs.set_len(total_ev); }
     let evs_ptr = Raw(evs.as_mut_ptr());
     ev_offs.into_par_iter().enumerate().for_each(|(g, mut off)| {
@@ -972,6 +999,7 @@ fn main() {
     let (ck_base, ck_offs) = scatter_offsets(&ck_counts);
     let total_ck = ck_base[np];
     let mut cks: Vec<Ck> = Vec::with_capacity(total_ck);
+    advise_huge(&cks);
     unsafe { cks.set_len(total_ck); }
     let cks_ptr = Raw(cks.as_mut_ptr());
     ck_parsed.par_iter().zip(ck_offs.into_par_iter()).for_each(|((v, _), mut off)| {
